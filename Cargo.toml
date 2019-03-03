@@ -1,0 +1,8 @@
+[package]
+name = "mpf-spike"
+version = "0.1.0"
+authors = ["Jan Kantert <jan-mpf@kantert.net>"]
+edition = "2018"
+
+[dependencies]
+timeout-readwrite = "0.1"

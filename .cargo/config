@@ -1,0 +1,5 @@
+[build]
+# target = "arm-unknown-linux-musleabi"
+
+[target.arm-unknown-linux-musleabi]
+linker = "arm-linux-gnueabi-gcc"
