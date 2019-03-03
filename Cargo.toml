@@ -6,3 +6,4 @@ edition = "2018"
 
 [dependencies]
 timeout-readwrite = "0.1"
+nix = "0.13.0"
