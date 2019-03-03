@@ -509,8 +509,8 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut fd_in = spi_fd_in;
         let mut fd_out = dmd_fd;
         loop {
-            let messsage = spi_rx.recv().unwrap();
-            match messsage {
+            let message = spi_rx.recv().unwrap();
+            match message {
                 SpiMessage::Poll {} => {
                     // Read SPI here
                     let mut switch_state = [0; 8];
@@ -548,10 +548,6 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         }
     });
 
-//    bus_handler.join();
-//    spi_handler.join();
-//    host_stdin_handler.join();
-//    host_stdout_handler.join();
     return vec![bus_handler, host_stdin_handler, host_stdout_handler, spi_handler];
 }
 
