@@ -7,3 +7,8 @@ edition = "2018"
 [dependencies]
 timeout-readwrite = "0.1"
 nix = "0.13.0"
+termios = "0.3"
+libc = "0.2.49"
+
+[profile.release]
+lto = true

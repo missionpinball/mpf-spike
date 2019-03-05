@@ -1,13 +1,23 @@
 use std::thread;
 use std::sync::mpsc;
-use std::io::{self};
+//use std::io::{self};
 use std::fs::File;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use timeout_readwrite::TimeoutReader;
 use std::os::unix::io::AsRawFd;
+use std::io::Error;
+use std::sync::mpsc::Sender;
+use termios::*;
+use termios::os::linux::*;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+use std::env;
+use std::os::unix::io::FromRawFd;
 
+extern crate termios;
 extern crate nix;
+extern crate libc;
 
 enum SpiMessage {
     Poll {
@@ -62,7 +72,11 @@ enum Response {
 
 #[cfg(not(test))]
 mod ioctl {
+    use nix::*;
+
+    #[allow(dead_code)]
     const GPIO_STATE: u16 = 0x3C02;
+
     const GPIO_ON: u16 = 0x3C03;
     const GPIO_OFF: u16 = 0x3C04;
 
@@ -183,16 +197,21 @@ mod tests {
 
         let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_out, spi_fd_in, spi_fd_out, backlight_fd);
 
-        // Send command to node (with response_len 2)
-        write_to_pipe(&host_in_tx, vec![0x81, 0x03, 0xf0, 0x10, 0x00, 0x02]);
+        // Test init
+        write_to_pipe(&host_in_tx, vec![0x80, 0x02, 0xf1, 0x8d, 0x00]);
+        let data = read_from_pipe(&bus_out_rx, 5);
+        assert_eq!(data, [0x80, 0x02, 0xf1, 0x8d, 0x00]);
+
+        // Send command to node (with response_len 12)
+        write_to_pipe(&host_in_tx, vec![0x81, 0x02, 0xfe, 0x7f, 0x0c]);
         // Check that node got message
-        let data = read_from_pipe(&bus_out_rx, 6);
-        assert_eq!(data, [0x81, 0x03, 0xf0, 0x10, 0x00, 0x02]);
+        let data = read_from_pipe(&bus_out_rx, 5);
+        assert_eq!(data, [0x81, 0x02, 0xfe, 0x7f, 0x0c]);
         // Node sends response
-        write_to_pipe(&bus_in_tx, vec![0x01, 0x02]);
+        write_to_pipe(&bus_in_tx, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Check that host got the response from the node
-        let data = read_from_pipe(&host_out_rx, 2);
-        assert_eq!(data, [0x01, 0x02]);
+        let data = read_from_pipe(&host_out_rx, 12);
+        assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
         // Sleep
         write_to_pipe(&host_in_tx, vec![0x01, 0x10]);
@@ -293,13 +312,93 @@ mod tests {
 
 
 fn main() {
-    let host_fd_in = TimeoutReader::new(io::stdin(), Duration::new(5, 0));
-    let host_fd_out = io::stdout();
-    let bus_fd = File::open("/dev/ttyS4").unwrap();
+    println!("MPF Spike Bridge!");
+
+    // Parse args first
+    let args: Vec<String> = env::args().collect();
+    // First arg is serial speed
+    let serial_speed;
+    if args.len() >= 2 {
+        match args[1].as_ref() {
+            "230400" => {serial_speed = B230400},
+            "460800" => {serial_speed = B460800},
+            "576000" => {serial_speed = B576000},
+            "921600" => {serial_speed = B921600},
+            "1000000" => {serial_speed = B1000000},
+            "1152000" => {serial_speed = B1152000},
+            "1500000" => {serial_speed = B1500000},
+            "2000000" => {serial_speed = B2000000},
+            "2500000" => {serial_speed = B2500000},
+            "3000000" => {serial_speed = B3000000},
+            "3500000" => {serial_speed = B3500000},
+            "4000000" => {serial_speed = B4000000},
+            _ => {serial_speed = 0 as u32}
+        }
+    } else {
+        serial_speed = 0 as u32;
+    }
+
+    let std_in;
+    let std_out;
+    unsafe {
+        std_out = File::from_raw_fd(1);
+        std_in = File::from_raw_fd(0);
+    }
+
+    // Switch baud rate
+    let termios_old = Termios::from_fd(std_in.as_raw_fd()).unwrap();
+    let mut termios = Termios::from_fd(std_in.as_raw_fd()).unwrap();
+    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    termios.c_oflag &= !OPOST;
+    termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    termios.c_cflag &= !(CSIZE | PARENB);
+    termios.c_cflag |= CS8;
+    if serial_speed > 0 {
+        cfsetospeed(&mut termios, serial_speed).unwrap();
+        cfsetispeed(&mut termios, serial_speed).unwrap();
+    }
+    tcsetattr(std_in.as_raw_fd(), TCSAFLUSH, &termios).unwrap();
+
+    let host_fd_in = TimeoutReader::new(std_in.try_clone().unwrap(), Duration::new(5, 0));
+    let host_fd_out = std_out;
+
+    // Open the bus
+    let bus_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/ttyS4").unwrap();
+    let mut termios = Termios::from_fd(bus_fd.as_raw_fd()).unwrap();
+    cfsetospeed(&mut termios, B460800).unwrap();
+    cfsetispeed(&mut termios, B460800).unwrap();
+
+    termios.c_cflag |= CLOCAL | CREAD;    /* ignore modem controls */
+    termios.c_cflag &= !CSIZE;
+    termios.c_cflag |= CS8;         /* 8-bit characters */
+    termios.c_cflag &= !PARENB;     /* no parity bit */
+    termios.c_cflag &= !CSTOPB;     /* only need 1 stop bit */
+    termios.c_cflag &= !CRTSCTS;    /* no hardware flow control */
+
+    /* setup for non-canonical mode */
+    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    termios.c_oflag &= !OPOST;
+
+    /* fetch bytes as they become available */
+    termios.c_cc[VMIN] = 1;
+    termios.c_cc[VTIME] = 1;
+    tcsetattr(bus_fd.as_raw_fd(), TCSANOW, &termios).unwrap();
+
+    // TODO: set TIOCM_RTS | TIOCM_DTR on bus_fd
     let bus_fd2 = bus_fd.try_clone().unwrap();
-    let spi_fd = File::open("/dev/spi1").unwrap();
-    let dmd_fd = File::open("/dev/spi0").unwrap();
+    let bus_fd = TimeoutReader::new(bus_fd, Duration::new(0, 100000));
+
+    // Open SPI for local switches
+    let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi1").unwrap();
+
+    // Open DMD
+    let dmd_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi0").unwrap();
+
+    // Open magic backlight device
     let backlight_fd = File::open("/dev/backlight").unwrap();
+
+    // Open magic gpio device
     let gpio_fd = File::open("/dev/gpio").unwrap();
 
     unsafe {
@@ -322,8 +421,90 @@ fn main() {
         // Disable amp (disabled for now because we do not use it anyway)
         //ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x6A).unwrap();
     }
-
+    tcsetattr(std_in.as_raw_fd(), TCSAFLUSH, &termios_old).unwrap();
+    println!("Resetting terminal mode and quitting.");
 }
+
+
+fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus_tx: &Sender<NodeBusMessage>, spi_tx: &Sender<SpiMessage>) -> Result<bool, Error> {
+    // First read node byte
+    let mut node = [0; 1];
+    host_fd_in.read_exact(&mut node)?;
+    match node[0] {
+        0 => {
+            // Poll node bus
+            let message = NodeBusMessage::Poll {};
+            bus_tx.send(message).unwrap();
+            // Poll SPI
+            let message = SpiMessage::Poll {};
+            spi_tx.send(message).unwrap();
+            Ok(false)
+        },
+        1 => {
+            // Sleep in node bus
+            let mut wait_ms = [0; 1];
+            host_fd_in.read_exact(&mut wait_ms)?;
+            let message = NodeBusMessage::Wait { wait_ms: wait_ms[0] };
+            bus_tx.send(message).unwrap();
+            Ok(false)
+        },
+        0xF5 => {
+            // Exit
+            Ok(true)
+        },
+        _ => {
+            // Commands to nodes
+            let mut len = [0; 1];
+            host_fd_in.read_exact(&mut len)?;
+            let mut cmd = [0; 1];
+            host_fd_in.read_exact(&mut cmd)?;
+            if node[0] == 0x80 && len[0] == 0 && cmd[0] == 0x90 {
+                // DMD frame
+                let mut data: [u8; 2048] = [0; 2048];
+                host_fd_in.read_exact(&mut data)?;
+                let message = SpiMessage::DmdFrame {
+                    data
+                };
+                spi_tx.send(message).unwrap();
+                Ok(false)
+            } else {
+                let data_len: usize = (len[0] - 2) as usize;
+                let mut data: [u8; 256] = [0; 256];
+                host_fd_in.read_exact(&mut data[0..(data_len as usize)])?;
+                let mut checksum = [0; 1];
+                host_fd_in.read_exact(&mut checksum)?;
+                let mut response_len = [0; 1];
+                host_fd_in.read_exact(&mut response_len)?;
+                if node[0] == 0x80 && cmd[0] == 0x11 {
+                    // Read local switches
+                    let message = SpiMessage::ReadLocalSwitches {};
+                    spi_tx.send(message).unwrap();
+                    Ok(false)
+                } else if node[0] == 0x80 && len[0] == 4 && cmd[0] == 0x80 {
+                    // LEDs on local node/Backlight
+                    let message = SpiMessage::BacklightLed {
+                        brightness: data[0]
+                    };
+                    spi_tx.send(message).unwrap();
+                    Ok(false)
+                } else {
+                    // Forward to node bus
+                    let message = NodeBusMessage::BusMessage {
+                        node: node[0],
+                        len: len[0],
+                        cmd: cmd[0],
+                        data,
+                        checksum: checksum[0],
+                        response_len: response_len[0]
+                    };
+                    bus_tx.send(message).unwrap();
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
 
 fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::Write + std::marker::Send + 'static,
     BIn: std::io::Read + std::marker::Send + 'static, BOut: std::io::Write + std::marker::Send + 'static,
@@ -352,16 +533,29 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                     fd_out.write(&[checksum, response_len]).unwrap();
                     if response_len > 0 {
                         let mut response = [0; 256];
-                        fd_in.read_exact(&mut response[0..(response_len as usize)]).unwrap();
-                        host_tx.send(Response::Message{data: response, len: response_len}).unwrap();
+                        match fd_in.read_exact(&mut response[0..(response_len as usize)]) {
+                            Ok(_) => {
+                                // Forward response to host
+                                host_tx.send(Response::Message{data: response, len: response_len}).unwrap();
+                            },
+                            Err(_) => {
+                                // Send desync response with corrent length
+                                host_tx.send(Response::Message{data: [55; 256], len: response_len}).unwrap();
+                                // Consume whatever is one the bus (may block for up to 200ms)
+                                let mut response = [0; 256];
+                                let _ = fd_in.read(&mut response);
+                            },
+                        }
                     }
 
                 },
                 NodeBusMessage::Poll => {
                     fd_out.write(&[0x00]).unwrap();
                     let mut response = [0; 1];
-                    fd_in.read_exact(&mut response).unwrap();
-                    host_tx.send(Response::Poll{result: response[0]}).unwrap();
+                    match fd_in.read_exact(&mut response) {
+                        Ok(_) => {host_tx.send(Response::Poll{result: response[0]}).unwrap();},
+                        Err(_) => {host_tx.send(Response::Poll{result: 55}).unwrap();},
+                    }
                 },
                 NodeBusMessage::Wait { wait_ms } => {
                     thread::sleep(Duration::from_millis(wait_ms as u64));
@@ -375,81 +569,16 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
     });
 
     let host_stdin_handler = thread::spawn(move || {
-        let mut fd = host_fd_in;
+        let mut host_fd_in = host_fd_in;
         loop {
-            // First read node byte
-            let mut node = [0; 1];
-            fd.read_exact(&mut node).unwrap();
-            match node[0] {
-                0 => {
-                    // Poll node bus
-                    let message = NodeBusMessage::Poll{};
-                    bus_tx.send(message).unwrap();
-                    // Poll SPI
-                    let message = SpiMessage::Poll {};
-                    spi_tx.send(message).unwrap();
-                },
-                1 => {
-                    // Sleep in node bus
-                    let mut wait_ms = [0; 1];
-                    fd.read_exact(&mut wait_ms).unwrap();
-                    let message = NodeBusMessage::Wait{wait_ms: wait_ms[0]};
-                    bus_tx.send(message).unwrap();
-                },
-                0xF5 => {
-                    // Exit
-                    bus_tx.send(NodeBusMessage::Exit{}).unwrap();
-                    spi_tx.send(SpiMessage::Exit{}).unwrap();
-                    return;
-                },
-                _ => {
-                    // Commands to nodes
-                    let mut len = [0; 1];
-                    fd.read_exact(&mut len).unwrap();
-                    let mut cmd = [0; 1];
-                    fd.read_exact(&mut cmd).unwrap();
-                    if node[0] == 0x80 && len[0] == 0 && cmd[0] == 0x90 {
-                        // DMD frame
-                        let mut data : [u8; 2048] = [0; 2048];
-                        fd.read_exact(&mut data).unwrap();
-                        let message = SpiMessage::DmdFrame {
-                            data
-                        };
-                        spi_tx.send(message).unwrap();
-                    } else {
-                        let data_len: usize = (len[0] - 2) as usize;
-                        let mut data : [u8; 256] = [0; 256];
-                        fd.read_exact(&mut data[0..(data_len as usize)]).unwrap();
-                        let mut checksum = [0; 1];
-                        fd.read_exact(&mut checksum).unwrap();
-                        let mut response_len = [0; 1];
-                        fd.read_exact(&mut response_len).unwrap();
-                        if node[0] == 0x80 && cmd[0] == 0x11 {
-                            // Read local switches
-                            let message = SpiMessage::ReadLocalSwitches {};
-                            spi_tx.send(message).unwrap();
-                        } else if node[0] == 0x80 && len[0] == 4 && cmd[0] == 0x80 {
-                            // LEDs on local node/Backlight
-                            let message = SpiMessage::BacklightLed {
-                                brightness: data[0]
-                            };
-                            spi_tx.send(message).unwrap();
-                        } else {
-                            // Forward to node bus
-                            let message = NodeBusMessage::BusMessage {
-                                node: node[0],
-                                len: len[0],
-                                cmd: cmd[0],
-                                data,
-                                checksum: checksum[0],
-                                response_len: response_len[0]
-                            };
-                            bus_tx.send(message).unwrap();
-                        }
-                    }
-                }
+            match host_thread(&mut host_fd_in, &bus_tx, &spi_tx) {
+                Ok(done) => {if done {break;}},
+                Err(..) => {break;},
             }
         }
+        bus_tx.send(NodeBusMessage::Exit {}).unwrap();
+        spi_tx.send(SpiMessage::Exit {}).unwrap();
+
     });
 
     let host_stdout_handler = thread::spawn(move || {
