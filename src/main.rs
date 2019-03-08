@@ -17,6 +17,7 @@ use std::os::unix::io::FromRawFd;
 
 extern crate termios;
 extern crate nix;
+#[cfg(not(test))]
 extern crate libc;
 
 enum SpiMessage {
@@ -114,6 +115,21 @@ mod ioctl {
 }
 
 #[cfg(test)]
+mod libc {
+    pub const O_NOCTTY: i32 = 1;
+    pub const O_SYNC: i32 = 2;
+
+    pub unsafe fn tcdrain(_fd: i32) {
+
+    }
+
+    pub unsafe fn tcflush(_fd: i32, _action: i32) {
+
+    }
+
+}
+
+#[cfg(test)]
 mod tests {
     use crate::run_threads;
     use std::sync::mpsc::Sender;
@@ -124,6 +140,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
     use std::fs::File;
+    use std::os::raw::c_int;
+    use std::sync::mpsc::RecvTimeoutError;
 
     struct TestPipeSender {
         sender: Sender<u8>
@@ -159,6 +177,22 @@ mod tests {
         }
     }
 
+    impl std::os::unix::io::AsRawFd for TestPipeReader {
+
+        fn as_raw_fd(&self) -> c_int {
+            return -1;
+        }
+
+    }
+
+    impl std::os::unix::io::AsRawFd for TestPipeSender {
+
+        fn as_raw_fd(&self) -> c_int {
+            return -1;
+        }
+
+    }
+
     fn write_to_pipe(pipe: &Sender<u8>, data: Vec<u8>) {
         for v in data {
             pipe.send(v).unwrap();
@@ -168,7 +202,11 @@ mod tests {
     fn read_from_pipe(pipe: &Receiver<u8>, len: usize) -> Vec<u8> {
         let mut data = Vec::new();
         for _ in (std::ops::Range { start: 0, end: len }) {
-            data.push(pipe.recv_timeout(Duration::new(5, 0)).unwrap());
+            match pipe.recv_timeout(Duration::new(5, 0)) {
+                Ok(value) => {data.push(value);},
+                Err(RecvTimeoutError::Timeout) => {panic!("Got a timeout from thread")}
+                Err(RecvTimeoutError::Disconnected) => {panic!("Thread disconnected")}
+            }
         }
         return data;
     }
@@ -387,7 +425,6 @@ fn main() {
 
     // TODO: set TIOCM_RTS | TIOCM_DTR on bus_fd
     let bus_fd2 = bus_fd.try_clone().unwrap();
-    let bus_fd = TimeoutReader::new(bus_fd, Duration::new(0, 100000));
 
     // Open SPI for local switches
     let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi1").unwrap();
@@ -402,10 +439,18 @@ fn main() {
     let gpio_fd = File::open("/dev/gpio").unwrap();
 
     unsafe {
+        // From NODEBUS_Init
+        ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x8C).unwrap();
+        ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x8A).unwrap();
+
         // Enable nodebus power
         ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x6B).unwrap();
         // Enable amp (disabled for now because we do not use it anyway)
         //ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x6A).unwrap();
+
+        // From NODEBUS_Init (only during open)
+        //ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x8E).unwrap();
+        //ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
     }
 
     let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd2, spi_fd, dmd_fd, backlight_fd);
@@ -507,7 +552,7 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
 
 
 fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::Write + std::marker::Send + 'static,
-    BIn: std::io::Read + std::marker::Send + 'static, BOut: std::io::Write + std::marker::Send + 'static,
+    BIn: std::io::Read + std::marker::Send + std::os::unix::io::AsRawFd + 'static, BOut: std::io::Write + std::marker::Send + std::os::unix::io::AsRawFd + 'static,
     SIn: std::io::Read + std::marker::Send + 'static, SOut: std::io::Write + std::marker::Send + 'static,
     Bl: std::marker::Send + std::os::unix::io::AsRawFd + 'static>
 (host_fd_in: HIn, host_fd_out: HOut, bus_fd_in: BIn, bus_fd_out: BOut, spi_fd_in: SIn, dmd_fd: SOut, backlight_fd: Bl) -> Vec<JoinHandle<()>> {
@@ -525,45 +570,59 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut fd_in = bus_fd_in;
         let mut fd_out = bus_fd_out;
         loop {
-            let received = bus_rx.recv().unwrap();
+            let received = bus_rx.recv();
             match received {
-                NodeBusMessage::BusMessage { node, cmd, len, data, checksum, response_len } => {
-                    fd_out.write(&[node, len, cmd]).unwrap();
-                    fd_out.write(&data[0..((len - 2) as usize)]).unwrap();
-                    fd_out.write(&[checksum, response_len]).unwrap();
-                    if response_len > 0 {
-                        let mut response = [0; 256];
-                        match fd_in.read_exact(&mut response[0..(response_len as usize)]) {
-                            Ok(_) => {
-                                // Forward response to host
-                                host_tx.send(Response::Message{data: response, len: response_len}).unwrap();
-                            },
-                            Err(_) => {
-                                // Send desync response with corrent length
-                                host_tx.send(Response::Message{data: [55; 256], len: response_len}).unwrap();
-                                // Consume whatever is one the bus (may block for up to 200ms)
+                Ok(message) => {
+                    match message {
+                        NodeBusMessage::BusMessage { node, cmd, len, data, checksum, response_len } => {
+                            unsafe {
+                                libc::tcflush(fd_in.as_raw_fd(), 0);
+                            }
+                            fd_out.write(&[node, len, cmd]).unwrap();
+                            fd_out.write(&data[0..((len - 2) as usize)]).unwrap();
+                            fd_out.write(&[checksum, response_len]).unwrap();
+                            if response_len > 0 {
                                 let mut response = [0; 256];
-                                let _ = fd_in.read(&mut response);
-                            },
-                        }
+                                match fd_in.read_exact(&mut response[0..(response_len as usize)]) {
+                                    Ok(_) => {
+                                        // Forward response to host
+                                        host_tx.send(Response::Message { data: response, len: response_len }).unwrap();
+                                    },
+                                    Err(_) => {
+                                        // Send desync response with corrent length
+                                        host_tx.send(Response::Message { data: [55; 256], len: response_len }).unwrap();
+                                        // Consume whatever is one the bus (may block for up to 200ms)
+                                        // TODO: implement tcsendbreak(fd, 0)
+                                        let mut response = [0; 256];
+                                        let _ = fd_in.read(&mut response);
+                                    },
+                                }
+                            }
+                        },
+                        NodeBusMessage::Poll => {
+                            fd_out.write(&[0x00]).unwrap();
+                            let mut response = [0; 1];
+                            match fd_in.read_exact(&mut response) {
+                                Ok(_) => { host_tx.send(Response::Poll { result: response[0] }).unwrap(); },
+                                Err(_) => { host_tx.send(Response::Poll { result: 55 }).unwrap(); },
+                            }
+                        },
+                        NodeBusMessage::Wait { wait_ms } => {
+                            thread::sleep(Duration::from_millis(wait_ms as u64));
+                        },
+                        NodeBusMessage::Exit => {
+                            let _result = host_tx.send(Response::Exit {});
+                            // result is intentionally ignored since we exit anyway
+                            return;
+                        },
                     }
-
-                },
-                NodeBusMessage::Poll => {
-                    fd_out.write(&[0x00]).unwrap();
-                    let mut response = [0; 1];
-                    match fd_in.read_exact(&mut response) {
-                        Ok(_) => {host_tx.send(Response::Poll{result: response[0]}).unwrap();},
-                        Err(_) => {host_tx.send(Response::Poll{result: 55}).unwrap();},
+                    unsafe {
+                        libc::tcdrain(fd_out.as_raw_fd());
                     }
-                },
-                NodeBusMessage::Wait { wait_ms } => {
-                    thread::sleep(Duration::from_millis(wait_ms as u64));
-                },
-                NodeBusMessage::Exit => {
-                    host_tx.send(Response::Exit{}).unwrap();
+                }
+                Err(_) => {
                     return;
-                },
+                }
             }
         }
     });
@@ -576,8 +635,10 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                 Err(..) => {break;},
             }
         }
-        bus_tx.send(NodeBusMessage::Exit {}).unwrap();
-        spi_tx.send(SpiMessage::Exit {}).unwrap();
+        let _result = bus_tx.send(NodeBusMessage::Exit {});
+        // Result is unused because we exit
+        let _result = spi_tx.send(SpiMessage::Exit {});
+        // Result is unused because we exit
 
     });
 
@@ -586,49 +647,56 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut poll_result_spi = PollResult::Unknown{};
         let mut poll_result_node = PollResult::Unknown{};
         loop {
-            let received = host_rx.recv().unwrap();
+            let received = host_rx.recv();
             match received {
-                Response::SpiPoll { dirty } => {
-                    if dirty {
-                        poll_result_spi = PollResult::Dirty {
-                            result: 0xF0
-                        };
-                    } else {
-                        poll_result_spi = PollResult::Clean {};
+                Ok(response) => {
+                    match response {
+                        Response::SpiPoll { dirty } => {
+                            if dirty {
+                                poll_result_spi = PollResult::Dirty {
+                                    result: 0xF0
+                                };
+                            } else {
+                                poll_result_spi = PollResult::Clean {};
+                            }
+                        },
+                        Response::Message { data, len } => {
+                            fd.write(&data[0..(len as usize)]).unwrap();
+                        },
+                        Response::Poll { result } => {
+                            if result > 0 {
+                                poll_result_node = PollResult::Dirty {
+                                    result
+                                };
+                            } else {
+                                poll_result_node = PollResult::Clean {};
+                            }
+                        },
+                        Response::Exit => { return },
+                    }
+                    match (&poll_result_spi, &poll_result_node) {
+                        (PollResult::Unknown, _) => {},
+                        (_, PollResult::Unknown) => {},
+                        (PollResult::Dirty { .. }, _) => {
+                            fd.write(&[0xF0]).unwrap();
+                            poll_result_spi = PollResult::Unknown {};
+                            poll_result_node = PollResult::Unknown {};
+                        },
+                        (_, PollResult::Dirty { result }) => {
+                            fd.write(&[*result]).unwrap();
+                            poll_result_spi = PollResult::Unknown {};
+                            poll_result_node = PollResult::Unknown {};
+                        },
+                        (_, PollResult::Clean) => {
+                            fd.write(&[0]).unwrap();
+                            poll_result_spi = PollResult::Unknown {};
+                            poll_result_node = PollResult::Unknown {};
+                        },
                     }
                 },
-                Response::Message { data, len } => {
-                    fd.write(&data[0..(len as usize)]).unwrap();
-                },
-                Response::Poll { result } => {
-                    if result > 0 {
-                        poll_result_node = PollResult::Dirty {
-                            result
-                        };
-                    } else {
-                        poll_result_node = PollResult::Clean {};
-                    }
-                },
-                Response::Exit => { return },
-            }
-            match (&poll_result_spi, &poll_result_node) {
-                (PollResult::Unknown, _) => {},
-                (_, PollResult::Unknown) => {},
-                (PollResult::Dirty { .. }, _) => {
-                    fd.write(&[0xF0]).unwrap();
-                    poll_result_spi = PollResult::Unknown {};
-                    poll_result_node = PollResult::Unknown {};
-                },
-                (_, PollResult::Dirty { result }) => {
-                    fd.write(&[*result]).unwrap();
-                    poll_result_spi = PollResult::Unknown {};
-                    poll_result_node = PollResult::Unknown {};
-                },
-                (_, PollResult::Clean) => {
-                    fd.write(&[0]).unwrap();
-                    poll_result_spi = PollResult::Unknown {};
-                    poll_result_node = PollResult::Unknown {};
-                },
+                Err(_) => {
+                    return;
+                }
             }
         }
     });
@@ -638,41 +706,55 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut fd_in = spi_fd_in;
         let mut fd_out = dmd_fd;
         loop {
-            let message = spi_rx.recv().unwrap();
-            match message {
-                SpiMessage::Poll {} => {
-                    // Read SPI here
-                    let mut switch_state = [0; 8];
-                    fd_in.read_exact(&mut switch_state).unwrap();
-                    host_tx2.send(Response::SpiPoll {dirty: switch_state != last_switch_state}).unwrap();
-                },
-                SpiMessage::DmdFrame { data } => {
-                    // Write to DMD via SPI
-                    fd_out.write(&data).unwrap();
-                },
-                SpiMessage::BacklightLed { brightness } => {
-                    // Control backlight LED
-                    unsafe {
-                        ioctl::set_brightness(backlight_fd.as_raw_fd(), brightness as i32 * 256).unwrap();
+            let response = spi_rx.recv();
+            match response {
+                Ok(message) => {
+                    match message {
+                        SpiMessage::Poll {} => {
+                            // Read SPI here
+                            let mut switch_state = [0; 8];
+                            fd_in.read_exact(&mut switch_state).unwrap();
+                            match host_tx2.send(Response::SpiPoll { dirty: switch_state != last_switch_state }) {
+                                Ok(_) => {},
+                                Err(_) => {return;}
+                            }
+
+                        },
+                        SpiMessage::DmdFrame { data } => {
+                            // Write to DMD via SPI
+                            fd_out.write(&data).unwrap();
+                        },
+                        SpiMessage::BacklightLed { brightness } => {
+                            // Control backlight LED
+                            unsafe {
+                                ioctl::set_brightness(backlight_fd.as_raw_fd(), brightness as i32 * 256).unwrap();
+                            }
+                        },
+                        SpiMessage::ReadLocalSwitches => {
+                            // Read local switches
+                            let mut switch_state = [0; 8];
+                            fd_in.read_exact(&mut switch_state).unwrap();
+                            let mut checksum: u32 = 0;
+                            last_switch_state = switch_state;
+                            for switch in switch_state.iter() {
+                                checksum += *switch as u32;
+                            }
+                            let mut data: [u8; 256] = [0; 256];
+                            data[0..8].clone_from_slice(&switch_state);
+                            data[8..10].clone_from_slice(&[0, 256_u16.wrapping_sub((checksum & 0xFF) as u16) as u8]);
+                            match host_tx2.send(Response::Message { data, len: 10 }) {
+                                Ok(_) => {},
+                                Err(_) => {return;}
+                            }
+                        },
+                        SpiMessage::Exit => {
+                            return;
+                        },
                     }
                 },
-                SpiMessage::ReadLocalSwitches => {
-                    // Read local switches
-                    let mut switch_state = [0; 8];
-                    fd_in.read_exact(&mut switch_state).unwrap();
-                    let mut checksum: u32 = 0;
-                    last_switch_state = switch_state;
-                    for switch in switch_state.iter() {
-                        checksum += *switch as u32;
-                    }
-                    let mut data:[u8; 256] = [0; 256];
-                    data[0..8].clone_from_slice(&switch_state);
-                    data[8..10].clone_from_slice(&[0, 256_u16.wrapping_sub((checksum & 0xFF) as u16) as u8]);
-                    host_tx2.send(Response::Message { data, len: 10 }).unwrap();
-                },
-                SpiMessage::Exit => {
+                Err(_) => {
                     return;
-                },
+                }
             }
         }
     });
