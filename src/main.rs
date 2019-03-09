@@ -14,6 +14,8 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::env;
 use std::os::unix::io::FromRawFd;
+use log::{info, trace, error};
+use std::io::ErrorKind;
 
 extern crate termios;
 extern crate nix;
@@ -119,13 +121,9 @@ mod libc {
     pub const O_NOCTTY: i32 = 1;
     pub const O_SYNC: i32 = 2;
 
-    pub unsafe fn tcdrain(_fd: i32) {
-
-    }
-
-    pub unsafe fn tcflush(_fd: i32, _action: i32) {
-
-    }
+    pub unsafe fn tcdrain(_fd: i32) {}
+    pub unsafe fn tcflush(_fd: i32, _action: i32) {}
+    pub unsafe fn tcsendbreak(_fd: i32, _duration: i32) -> i32 {0}
 
 }
 
@@ -142,6 +140,7 @@ mod tests {
     use std::fs::File;
     use std::os::raw::c_int;
     use std::sync::mpsc::RecvTimeoutError;
+    use std::os::unix::io::AsRawFd;
 
     struct TestPipeSender {
         sender: Sender<u8>
@@ -213,6 +212,7 @@ mod tests {
 
     #[test]
     fn it_works() {
+        stderrlog::new().module(module_path!()).init().unwrap();
         let (host_in_tx, host_in_rx) = mpsc::channel::<u8>();
         let host_fd_in = TestPipeReader{ receiver: host_in_rx };
 
@@ -221,6 +221,7 @@ mod tests {
 
         let (bus_in_tx, bus_in_rx) = mpsc::channel::<u8>();
         let bus_fd_in = TestPipeReader{ receiver: bus_in_rx };
+        let bus_fd_in_raw = bus_fd_in.as_raw_fd();
 
         let (bus_out_tx, bus_out_rx) = mpsc::channel::<u8>();
         let bus_fd_out = TestPipeSender{ sender: bus_out_tx };
@@ -233,7 +234,7 @@ mod tests {
 
         let backlight_fd = File::open("/dev/null").unwrap();
 
-        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_out, spi_fd_in, spi_fd_out, backlight_fd);
+        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_in_raw, bus_fd_out, spi_fd_in, spi_fd_out, backlight_fd);
 
         // Test init
         write_to_pipe(&host_in_tx, vec![0x80, 0x02, 0xf1, 0x8d, 0x00]);
@@ -351,6 +352,8 @@ mod tests {
 
 fn main() {
     println!("MPF Spike Bridge!");
+    stderrlog::new().module(module_path!()).verbosity(10).init().unwrap();
+    trace!("MPF Spike Bridge Started!");
 
     // Parse args first
     let args: Vec<String> = env::args().collect();
@@ -386,11 +389,8 @@ fn main() {
     // Switch baud rate
     let termios_old = Termios::from_fd(std_in.as_raw_fd()).unwrap();
     let mut termios = Termios::from_fd(std_in.as_raw_fd()).unwrap();
-    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    termios.c_oflag &= !OPOST;
-    termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    termios.c_cflag &= !(CSIZE | PARENB);
-    termios.c_cflag |= CS8;
+    cfmakeraw(&mut termios);
+
     if serial_speed > 0 {
         cfsetospeed(&mut termios, serial_speed).unwrap();
         cfsetispeed(&mut termios, serial_speed).unwrap();
@@ -425,6 +425,8 @@ fn main() {
 
     // TODO: set TIOCM_RTS | TIOCM_DTR on bus_fd
     let bus_fd2 = bus_fd.try_clone().unwrap();
+    let bus_fd_raw = bus_fd.as_raw_fd();
+    let bus_fd = TimeoutReader::new(bus_fd.try_clone().unwrap(), Duration::from_millis(200));
 
     // Open SPI for local switches
     let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi1").unwrap();
@@ -453,12 +455,14 @@ fn main() {
         //ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
     }
 
-    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd2, spi_fd, dmd_fd, backlight_fd);
+    trace!("Starting threads!");
+    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd);
 
-
+    trace!("Waiting for threads!");
     for thread in threads {
         thread.join().unwrap();
     }
+    trace!("All threads stopped.");
 
     unsafe {
         // Disable nodebus power
@@ -468,33 +472,48 @@ fn main() {
     }
     tcsetattr(std_in.as_raw_fd(), TCSAFLUSH, &termios_old).unwrap();
     println!("Resetting terminal mode and quitting.");
+    info!("Quitting");
 }
 
 
 fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus_tx: &Sender<NodeBusMessage>, spi_tx: &Sender<SpiMessage>) -> Result<bool, Error> {
     // First read node byte
     let mut node = [0; 1];
+    trace!("Host: Reading Node Info.");
     host_fd_in.read_exact(&mut node)?;
     match node[0] {
         0 => {
+            trace!("Host: Got Poll");
             // Poll node bus
             let message = NodeBusMessage::Poll {};
-            bus_tx.send(message).unwrap();
+            match bus_tx.send(message) {
+                Ok(_) => {},
+                Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send poll to nodebus"));},
+            }
             // Poll SPI
             let message = SpiMessage::Poll {};
-            spi_tx.send(message).unwrap();
+            match spi_tx.send(message) {
+                Ok(_) => {},
+                Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send poll to SPI"));},
+            }
             Ok(false)
         },
         1 => {
+            trace!("Host: Got sleep");
             // Sleep in node bus
             let mut wait_ms = [0; 1];
             host_fd_in.read_exact(&mut wait_ms)?;
             let message = NodeBusMessage::Wait { wait_ms: wait_ms[0] };
-            bus_tx.send(message).unwrap();
+            trace!("Host: Got sleep for {}", wait_ms[0]);
+            match bus_tx.send(message) {
+                Ok(_) => {},
+                Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send sleep to nodebus"));},
+            }
             Ok(false)
         },
         0xF5 => {
             // Exit
+            trace!("Host: Got exit");
             Ok(true)
         },
         _ => {
@@ -505,14 +524,20 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
             host_fd_in.read_exact(&mut cmd)?;
             if node[0] == 0x80 && len[0] == 0 && cmd[0] == 0x90 {
                 // DMD frame
+                trace!("Host: Got DMD frame");
                 let mut data: [u8; 2048] = [0; 2048];
                 host_fd_in.read_exact(&mut data)?;
                 let message = SpiMessage::DmdFrame {
                     data
                 };
-                spi_tx.send(message).unwrap();
+                trace!("Host: Got DMD frame data");
+                match spi_tx.send(message) {
+                    Ok(_) => {},
+                    Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send DMD frame"));},
+                }
                 Ok(false)
             } else {
+                trace!("Host: Got node command");
                 let data_len: usize = (len[0] - 2) as usize;
                 let mut data: [u8; 256] = [0; 256];
                 host_fd_in.read_exact(&mut data[0..(data_len as usize)])?;
@@ -522,18 +547,27 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
                 host_fd_in.read_exact(&mut response_len)?;
                 if node[0] == 0x80 && cmd[0] == 0x11 {
                     // Read local switches
+                    trace!("Host: Read local switches");
                     let message = SpiMessage::ReadLocalSwitches {};
-                    spi_tx.send(message).unwrap();
+                    match spi_tx.send(message) {
+                        Ok(_) => {},
+                        Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send read switches to spi"));},
+                    }
                     Ok(false)
                 } else if node[0] == 0x80 && len[0] == 4 && cmd[0] == 0x80 {
                     // LEDs on local node/Backlight
+                    trace!("Host: Set backlight");
                     let message = SpiMessage::BacklightLed {
                         brightness: data[0]
                     };
-                    spi_tx.send(message).unwrap();
+                    match spi_tx.send(message) {
+                        Ok(_) => {},
+                        Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send set backlight to spi"));},
+                    }
                     Ok(false)
                 } else {
                     // Forward to node bus
+                    trace!("Host: Got nodebus message");
                     let message = NodeBusMessage::BusMessage {
                         node: node[0],
                         len: len[0],
@@ -542,7 +576,10 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
                         checksum: checksum[0],
                         response_len: response_len[0]
                     };
-                    bus_tx.send(message).unwrap();
+                    match bus_tx.send(message) {
+                        Ok(_) => {},
+                        Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send message to nodebus"));},
+                    }
                     Ok(false)
                 }
             }
@@ -552,10 +589,11 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
 
 
 fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::Write + std::marker::Send + 'static,
-    BIn: std::io::Read + std::marker::Send + std::os::unix::io::AsRawFd + 'static, BOut: std::io::Write + std::marker::Send + std::os::unix::io::AsRawFd + 'static,
+    BIn: std::io::Read + std::marker::Send + 'static,
+    BOut: std::io::Write + std::marker::Send + std::os::unix::io::AsRawFd + 'static,
     SIn: std::io::Read + std::marker::Send + 'static, SOut: std::io::Write + std::marker::Send + 'static,
     Bl: std::marker::Send + std::os::unix::io::AsRawFd + 'static>
-(host_fd_in: HIn, host_fd_out: HOut, bus_fd_in: BIn, bus_fd_out: BOut, spi_fd_in: SIn, dmd_fd: SOut, backlight_fd: Bl) -> Vec<JoinHandle<()>> {
+(host_fd_in: HIn, host_fd_out: HOut, bus_fd_in: BIn,  bus_fd_in_raw: i32, bus_fd_out: BOut, spi_fd_in: SIn, dmd_fd: SOut, backlight_fd: Bl) -> Vec<JoinHandle<()>> {
     // Talk to the spike bus
     let (bus_tx, bus_rx) = mpsc::channel::<NodeBusMessage>();
 
@@ -570,47 +608,73 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut fd_in = bus_fd_in;
         let mut fd_out = bus_fd_out;
         loop {
+            trace!("Bus: Waiting for message");
             let received = bus_rx.recv();
             match received {
                 Ok(message) => {
                     match message {
                         NodeBusMessage::BusMessage { node, cmd, len, data, checksum, response_len } => {
+                            trace!("Bus: Sending message. node: {} cmd: {} len: {} response_len: {}", node, cmd, len, response_len);
                             unsafe {
-                                libc::tcflush(fd_in.as_raw_fd(), 0);
+                                libc::tcflush(bus_fd_in_raw, 0);
                             }
+                            trace!("Bus: Flushed bus_fd_in");
                             fd_out.write(&[node, len, cmd]).unwrap();
                             fd_out.write(&data[0..((len - 2) as usize)]).unwrap();
                             fd_out.write(&[checksum, response_len]).unwrap();
                             if response_len > 0 {
+                                trace!("Bus: Reading input");
                                 let mut response = [0; 256];
                                 match fd_in.read_exact(&mut response[0..(response_len as usize)]) {
                                     Ok(_) => {
+                                        trace!("Bus: Got response");
                                         // Forward response to host
-                                        host_tx.send(Response::Message { data: response, len: response_len }).unwrap();
+                                        match host_tx.send(Response::Message { data: response, len: response_len }) {
+                                            Ok(_) => {},
+                                            Err(err) => {error!("Bus: Got error sending to host {}", err); return;},
+                                        }
                                     },
-                                    Err(_) => {
+                                    Err(err) => {
+                                        error!("Bus: Got error during read: {}", err);
                                         // Send desync response with corrent length
-                                        host_tx.send(Response::Message { data: [55; 256], len: response_len }).unwrap();
-                                        // Consume whatever is one the bus (may block for up to 200ms)
-                                        // TODO: implement tcsendbreak(fd, 0)
-                                        let mut response = [0; 256];
-                                        let _ = fd_in.read(&mut response);
+                                        match host_tx.send(Response::Message { data: [55; 256], len: response_len }) {
+                                            Ok(_) => {},
+                                            Err(err) => {error!("Bus: Got error sending to host {}", err); return;},
+                                        }
+                                        // Recover the bus
+                                        unsafe {
+                                            libc::tcsendbreak(fd_out.as_raw_fd(), 0);
+                                        }
                                     },
                                 }
                             }
                         },
                         NodeBusMessage::Poll => {
+                            trace!("Bus: Poll");
                             fd_out.write(&[0x00]).unwrap();
                             let mut response = [0; 1];
+                            let message;
                             match fd_in.read_exact(&mut response) {
-                                Ok(_) => { host_tx.send(Response::Poll { result: response[0] }).unwrap(); },
-                                Err(_) => { host_tx.send(Response::Poll { result: 55 }).unwrap(); },
+                                Ok(_) => {
+                                    message = Response::Poll { result: response[0] }
+
+                                },
+                                Err(err) => {
+                                    error!("Bus: Got error {}", err);
+                                    message = Response::Poll { result: 55 };
+                                },
+                            }
+                            match host_tx.send(message) {
+                                Ok(_) => {},
+                                Err(err) => {error!("Bus: Got error sending to host {}", err); return;},
                             }
                         },
                         NodeBusMessage::Wait { wait_ms } => {
+                            trace!("Bus: Sleep {}", wait_ms);
                             thread::sleep(Duration::from_millis(wait_ms as u64));
                         },
                         NodeBusMessage::Exit => {
+                            trace!("Bus: Got exit");
                             let _result = host_tx.send(Response::Exit {});
                             // result is intentionally ignored since we exit anyway
                             return;
@@ -620,7 +684,8 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                         libc::tcdrain(fd_out.as_raw_fd());
                     }
                 }
-                Err(_) => {
+                Err(err) => {
+                    error!("Bus: Got error during message receiving: {}", err);
                     return;
                 }
             }
@@ -631,8 +696,8 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut host_fd_in = host_fd_in;
         loop {
             match host_thread(&mut host_fd_in, &bus_tx, &spi_tx) {
-                Ok(done) => {if done {break;}},
-                Err(..) => {break;},
+                Ok(done) => {if done {info!("Host: Thread done"); break;}},
+                Err(err) => {error!("Host: Got error {}", err); break;},
             }
         }
         let _result = bus_tx.send(NodeBusMessage::Exit {});
@@ -647,11 +712,13 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut poll_result_spi = PollResult::Unknown{};
         let mut poll_result_node = PollResult::Unknown{};
         loop {
+            trace!("Stdout: Waiting for message");
             let received = host_rx.recv();
             match received {
                 Ok(response) => {
                     match response {
                         Response::SpiPoll { dirty } => {
+                            trace!("Stdout: Got SPI poll result");
                             if dirty {
                                 poll_result_spi = PollResult::Dirty {
                                     result: 0xF0
@@ -661,9 +728,11 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                             }
                         },
                         Response::Message { data, len } => {
+                            trace!("Stdout: Got raw message");
                             fd.write(&data[0..(len as usize)]).unwrap();
                         },
                         Response::Poll { result } => {
+                            trace!("Stdout: Got Nodebus poll result");
                             if result > 0 {
                                 poll_result_node = PollResult::Dirty {
                                     result
@@ -672,29 +741,33 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                                 poll_result_node = PollResult::Clean {};
                             }
                         },
-                        Response::Exit => { return },
+                        Response::Exit => {trace!("Stdout: Got exit"); return },
                     }
                     match (&poll_result_spi, &poll_result_node) {
                         (PollResult::Unknown, _) => {},
                         (_, PollResult::Unknown) => {},
                         (PollResult::Dirty { .. }, _) => {
+                            trace!("Stdout: Sending SPI dirty");
                             fd.write(&[0xF0]).unwrap();
                             poll_result_spi = PollResult::Unknown {};
                             poll_result_node = PollResult::Unknown {};
                         },
                         (_, PollResult::Dirty { result }) => {
+                            trace!("Stdout: Sending nodebus dirty");
                             fd.write(&[*result]).unwrap();
                             poll_result_spi = PollResult::Unknown {};
                             poll_result_node = PollResult::Unknown {};
                         },
                         (_, PollResult::Clean) => {
+                            trace!("Stdout: Sending poll clean");
                             fd.write(&[0]).unwrap();
                             poll_result_spi = PollResult::Unknown {};
                             poll_result_node = PollResult::Unknown {};
                         },
                     }
                 },
-                Err(_) => {
+                Err(err) => {
+                    error!("Stdout: Got error: {}", err);
                     return;
                 }
             }
@@ -706,31 +779,36 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         let mut fd_in = spi_fd_in;
         let mut fd_out = dmd_fd;
         loop {
+            trace!("SPI: Waiting for message");
             let response = spi_rx.recv();
             match response {
                 Ok(message) => {
                     match message {
                         SpiMessage::Poll {} => {
+                            trace!("SPI: Got poll");
                             // Read SPI here
                             let mut switch_state = [0; 8];
                             fd_in.read_exact(&mut switch_state).unwrap();
                             match host_tx2.send(Response::SpiPoll { dirty: switch_state != last_switch_state }) {
                                 Ok(_) => {},
-                                Err(_) => {return;}
+                                Err(err) => {error!("SPI: Error sending to host (1): {}", err); return;}
                             }
 
                         },
                         SpiMessage::DmdFrame { data } => {
                             // Write to DMD via SPI
+                            trace!("SPI: Writing DMD frame");
                             fd_out.write(&data).unwrap();
                         },
                         SpiMessage::BacklightLed { brightness } => {
                             // Control backlight LED
+                            trace!("SPI: Setting backlight to {}", brightness);
                             unsafe {
                                 ioctl::set_brightness(backlight_fd.as_raw_fd(), brightness as i32 * 256).unwrap();
                             }
                         },
                         SpiMessage::ReadLocalSwitches => {
+                            trace!("SPI: Reading local switches");
                             // Read local switches
                             let mut switch_state = [0; 8];
                             fd_in.read_exact(&mut switch_state).unwrap();
@@ -744,15 +822,17 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                             data[8..10].clone_from_slice(&[0, 256_u16.wrapping_sub((checksum & 0xFF) as u16) as u8]);
                             match host_tx2.send(Response::Message { data, len: 10 }) {
                                 Ok(_) => {},
-                                Err(_) => {return;}
+                                Err(err) => {error!("SPI: Error sending to host (2): {}", err); return;}
                             }
                         },
                         SpiMessage::Exit => {
+                            trace!("SPI: Got exit");
                             return;
                         },
                     }
                 },
-                Err(_) => {
+                Err(err) => {
+                    error!("SPI: Error reading message: {}", err);
                     return;
                 }
             }

@@ -2,4 +2,4 @@
 target = "armv5te-unknown-linux-musleabi"
 
 [target.armv5te-unknown-linux-musleabi]
-linker = "arm-linux-gnueabi-gcc"
+linker = "arm-unknown-linux-musleabi-gcc"
