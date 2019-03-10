@@ -85,7 +85,7 @@ mod ioctl {
 
     const BACKLIGHT_MAGIC: u16 = 0x4001;
 
-    ioctl_write_int_bad!(set_brightness, BACKLIGHT_MAGIC);
+    ioctl_write_ptr_bad!(set_brightness, BACKLIGHT_MAGIC, libc::c_int);
 
     #[allow(dead_code)]
     ioctl_read_bad!(get_gpio_state, GPIO_STATE, bool);
@@ -95,23 +95,37 @@ mod ioctl {
 }
 
 #[cfg(test)]
+#[macro_use(lazy_static)]
+extern crate lazy_static;
+
+#[cfg(test)]
 mod ioctl {
     use nix::Error;
 
-    pub unsafe fn set_brightness(_fd: i32, _value: i32) -> Result<(), Error> {
+
+    use std::sync::{Arc, Mutex};
+
+    lazy_static! {
+        pub static ref BACKLIGHT_BRIGHTNESS: Arc<Mutex<i32>> =
+            Arc::new(Mutex::new(0));
+    }
+
+    pub unsafe fn set_brightness(_fd: i32, _value: &libc::c_int) -> Result<(), Error> {
+        let mut data = BACKLIGHT_BRIGHTNESS.lock().unwrap();
+        *data = *_value;
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub unsafe fn get_gpio_state(_fd: i32, _value: i32) -> Result<bool, Error> {
+    pub unsafe fn get_gpio_state(_fd: i32, _value: libc::c_int) -> Result<bool, Error> {
         Ok(false)
     }
 
-    pub unsafe fn set_gpio_on(_fd: i32, _value: i32) -> Result<(), Error> {
+    pub unsafe fn set_gpio_on(_fd: i32, _value: libc::c_int) -> Result<(), Error> {
         Ok(())
     }
 
-    pub unsafe fn set_gpio_off(_fd: i32, _value: i32) -> Result<(), Error> {
+    pub unsafe fn set_gpio_off(_fd: i32, _value: libc::c_int) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -120,6 +134,8 @@ mod ioctl {
 mod libc {
     pub const O_NOCTTY: i32 = 1;
     pub const O_SYNC: i32 = 2;
+    #[allow(non_camel_case_types)]
+    pub type c_int = i32;
 
     pub unsafe fn tcdrain(_fd: i32) {}
     pub unsafe fn tcflush(_fd: i32, _action: i32) {}
@@ -141,6 +157,7 @@ mod tests {
     use std::os::raw::c_int;
     use std::sync::mpsc::RecvTimeoutError;
     use std::os::unix::io::AsRawFd;
+    use crate::ioctl;
 
     struct TestPipeSender {
         sender: Sender<u8>
@@ -325,7 +342,18 @@ mod tests {
 
         // Set backlight
         write_to_pipe(&host_in_tx, vec![0x80, 0x04, 0x80, 0x00, 0xff, 0xff, 0x00]);
-        // Could assert on ioctl here
+        // Send command to node (with response_len 12) to make sure that everything was processed
+        write_to_pipe(&host_in_tx, vec![0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 5);
+        assert_eq!(data, [0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 12);
+        assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Assert backlight
+        assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xff * 256);
 
         // Send DMD frame
         let mut dmd_frame = vec![0; 2048];
@@ -558,7 +586,7 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
                     // LEDs on local node/Backlight
                     trace!("Host: Set backlight");
                     let message = SpiMessage::BacklightLed {
-                        brightness: data[0]
+                        brightness: data[1]
                     };
                     match spi_tx.send(message) {
                         Ok(_) => {},
@@ -803,8 +831,9 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                         SpiMessage::BacklightLed { brightness } => {
                             // Control backlight LED
                             trace!("SPI: Setting backlight to {}", brightness);
+                            let brightness = brightness as libc::c_int * 256;
                             unsafe {
-                                ioctl::set_brightness(backlight_fd.as_raw_fd(), brightness as i32 * 256).unwrap();
+                                ioctl::set_brightness(backlight_fd.as_raw_fd(), &brightness).unwrap();
                             }
                         },
                         SpiMessage::ReadLocalSwitches => {
