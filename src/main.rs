@@ -52,6 +52,12 @@ enum NodeBusMessage {
         checksum: u8,
         response_len: u8
     },
+    BridgeMessage {
+        cmd: u8,
+        len: u8,
+        data: [u8; 256],
+        response_len: u8
+    },
     Poll,
     Wait {
         wait_ms: u8
@@ -137,7 +143,7 @@ mod libc {
     #[allow(non_camel_case_types)]
     pub type c_int = i32;
 
-    pub unsafe fn tcdrain(_fd: i32) {}
+    //pub unsafe fn tcdrain(_fd: i32) {}
     pub unsafe fn tcflush(_fd: i32, _action: i32) {}
     pub unsafe fn tcsendbreak(_fd: i32, _duration: i32) -> i32 {0}
 
@@ -326,7 +332,7 @@ mod tests {
         write_to_pipe(&spi_in_tx, vec![0x03, 0, 0, 0, 0, 0, 0, 0]);
         // Check that host got the response
         let data = read_from_pipe(&host_out_rx, 10);
-        assert_eq!(data, [0x03, 0, 0, 0, 0, 0, 0, 0, 0, 253]);
+        assert_eq!(data, [0x03, 0, 0, 0, 0, 0, 0, 0, 253, 0]);
 
         // Poll (SPI no longer dirty but node dirty)
         write_to_pipe(&host_in_tx, vec![0x00]);
@@ -354,6 +360,35 @@ mod tests {
         assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Assert backlight
         assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xff * 256);
+
+        // SetResponseTime
+        write_to_pipe(&host_in_tx, vec![0x06, 0x02, 0x45, 0x03, 0x00]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 4);
+        assert_eq!(data, [0x06, 0x02, 0x45, 0x03]);
+        // No response
+
+        // GetBridgeVersion
+        write_to_pipe(&host_in_tx, vec![0x03, 0x00, 0x03]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 2);
+        assert_eq!(data, [0x03, 0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x01, 0x00, 0x03]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 3);
+        assert_eq!(data, vec![0x01, 0x00, 0x03]);
+
+        // GetBridgeState
+        write_to_pipe(&host_in_tx, vec![0x05, 0x00, 0x01]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 2);
+        assert_eq!(data, [0x05, 0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x18]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, vec![0x18]);
 
         // Send DMD frame
         let mut dmd_frame = vec![0; 2048];
@@ -420,8 +455,7 @@ fn main() {
     cfmakeraw(&mut termios);
 
     if serial_speed > 0 {
-        cfsetospeed(&mut termios, serial_speed).unwrap();
-        cfsetispeed(&mut termios, serial_speed).unwrap();
+        cfsetspeed(&mut termios, serial_speed).unwrap();
     }
     tcsetattr(std_in.as_raw_fd(), TCSAFLUSH, &termios).unwrap();
 
@@ -431,30 +465,17 @@ fn main() {
     // Open the bus
     let bus_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/ttyS4").unwrap();
     let mut termios = Termios::from_fd(bus_fd.as_raw_fd()).unwrap();
-    cfsetospeed(&mut termios, B460800).unwrap();
-    cfsetispeed(&mut termios, B460800).unwrap();
-
-    termios.c_cflag |= CLOCAL | CREAD;    /* ignore modem controls */
-    termios.c_cflag &= !CSIZE;
-    termios.c_cflag |= CS8;         /* 8-bit characters */
-    termios.c_cflag &= !PARENB;     /* no parity bit */
-    termios.c_cflag &= !CSTOPB;     /* only need 1 stop bit */
-    termios.c_cflag &= !CRTSCTS;    /* no hardware flow control */
-
-    /* setup for non-canonical mode */
-    termios.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    termios.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    termios.c_oflag &= !OPOST;
+    cfmakeraw(&mut termios);
+    cfsetspeed(&mut termios, B460800).unwrap();
 
     /* fetch bytes as they become available */
-    termios.c_cc[VMIN] = 1;
-    termios.c_cc[VTIME] = 1;
+//    termios.c_cc[VMIN] = 1;
+//    termios.c_cc[VTIME] = 1;
     tcsetattr(bus_fd.as_raw_fd(), TCSANOW, &termios).unwrap();
 
-    // TODO: set TIOCM_RTS | TIOCM_DTR on bus_fd
     let bus_fd2 = bus_fd.try_clone().unwrap();
     let bus_fd_raw = bus_fd.as_raw_fd();
-    let bus_fd = TimeoutReader::new(bus_fd.try_clone().unwrap(), Duration::from_millis(200));
+    let bus_fd = TimeoutReader::new(bus_fd, Duration::from_millis(200));
 
     // Open SPI for local switches
     let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi1").unwrap();
@@ -539,6 +560,28 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
             }
             Ok(false)
         },
+        2 ... 10 => {
+            trace!("Host: Got Bridge Command");
+            let mut len = [0; 1];
+            host_fd_in.read_exact(&mut len)?;
+            let mut data: [u8; 256] = [0; 256];
+            if len[0] > 0 {
+                host_fd_in.read_exact(&mut data[0..(len[0] as usize)])?;
+            }
+            let mut response_len = [0; 1];
+            host_fd_in.read_exact(&mut response_len)?;
+            let message = NodeBusMessage::BridgeMessage {
+                cmd: node[0],
+                len: len[0],
+                data,
+                response_len: response_len[0]
+            };
+            match bus_tx.send(message) {
+                Ok(_) => {},
+                Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send bridge command to nodebus"));},
+            }
+            Ok(false)
+        }
         0xF5 => {
             // Exit
             trace!("Host: Got exit");
@@ -638,18 +681,22 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         loop {
             trace!("Bus: Waiting for message");
             let received = bus_rx.recv();
+            // flush input
+            unsafe {
+                libc::tcflush(bus_fd_in_raw, TCIFLUSH);
+            }
+            trace!("Bus: Flushed bus_fd_in");
             match received {
                 Ok(message) => {
                     match message {
                         NodeBusMessage::BusMessage { node, cmd, len, data, checksum, response_len } => {
                             trace!("Bus: Sending message. node: {} cmd: {} len: {} response_len: {}", node, cmd, len, response_len);
-                            unsafe {
-                                libc::tcflush(bus_fd_in_raw, 0);
-                            }
-                            trace!("Bus: Flushed bus_fd_in");
-                            fd_out.write(&[node, len, cmd]).unwrap();
-                            fd_out.write(&data[0..((len - 2) as usize)]).unwrap();
-                            fd_out.write(&[checksum, response_len]).unwrap();
+                            let mut message = vec!();
+                            message.extend(&[node, len, cmd]);
+                            message.extend(&data[0..((len - 2) as usize)]);
+                            message.extend(&[checksum, response_len]);
+                            fd_out.write(message.as_slice()).unwrap();
+                            fd_out.flush().unwrap();
                             if response_len > 0 {
                                 trace!("Bus: Reading input");
                                 let mut response = [0; 256];
@@ -677,9 +724,46 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                                 }
                             }
                         },
+                        NodeBusMessage::BridgeMessage { cmd, len, data, response_len } => {
+                            trace!("Bus: Sending message to bridge. cmd: {} len: {} response_len: {}", cmd, len, response_len);
+                            let mut message = vec!();
+                            message.extend(&[cmd, len]);
+                            if len > 0 {
+                                message.extend(&data[0..(len as usize)]);
+                            }
+                            fd_out.write(message.as_slice()).unwrap();
+                            fd_out.flush().unwrap();
+                            if response_len > 0 {
+                                trace!("Bus: Reading input");
+                                let mut response = [0; 256];
+                                match fd_in.read_exact(&mut response[0..(response_len as usize)]) {
+                                    Ok(_) => {
+                                        trace!("Bus: Got response");
+                                        // Forward response to host
+                                        match host_tx.send(Response::Message { data: response, len: response_len }) {
+                                            Ok(_) => {},
+                                            Err(err) => {error!("Bus: Got error sending to host {}", err); return;},
+                                        }
+                                    },
+                                    Err(err) => {
+                                        error!("Bus: Got error during read: {}", err);
+                                        // Send desync response with corrent length
+                                        match host_tx.send(Response::Message { data: [54; 256], len: response_len }) {
+                                            Ok(_) => {},
+                                            Err(err) => {error!("Bus: Got error sending to host {}", err); return;},
+                                        }
+                                        // Recover the bus
+                                        unsafe {
+                                            libc::tcsendbreak(fd_out.as_raw_fd(), 0);
+                                        }
+                                    },
+                                }
+                            }
+                        },
                         NodeBusMessage::Poll => {
                             trace!("Bus: Poll");
                             fd_out.write(&[0x00]).unwrap();
+                            fd_out.flush().unwrap();
                             let mut response = [0; 1];
                             let message;
                             match fd_in.read_exact(&mut response) {
@@ -707,9 +791,6 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                             // result is intentionally ignored since we exit anyway
                             return;
                         },
-                    }
-                    unsafe {
-                        libc::tcdrain(fd_out.as_raw_fd());
                     }
                 }
                 Err(err) => {
@@ -758,6 +839,7 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                         Response::Message { data, len } => {
                             trace!("Stdout: Got raw message");
                             fd.write(&data[0..(len as usize)]).unwrap();
+                            fd.flush().unwrap();
                         },
                         Response::Poll { result } => {
                             trace!("Stdout: Got Nodebus poll result");
@@ -777,18 +859,21 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                         (PollResult::Dirty { .. }, _) => {
                             trace!("Stdout: Sending SPI dirty");
                             fd.write(&[0xF0]).unwrap();
+                            fd.flush().unwrap();
                             poll_result_spi = PollResult::Unknown {};
                             poll_result_node = PollResult::Unknown {};
                         },
                         (_, PollResult::Dirty { result }) => {
                             trace!("Stdout: Sending nodebus dirty");
                             fd.write(&[*result]).unwrap();
+                            fd.flush().unwrap();
                             poll_result_spi = PollResult::Unknown {};
                             poll_result_node = PollResult::Unknown {};
                         },
                         (_, PollResult::Clean) => {
                             trace!("Stdout: Sending poll clean");
                             fd.write(&[0]).unwrap();
+                            fd.flush().unwrap();
                             poll_result_spi = PollResult::Unknown {};
                             poll_result_node = PollResult::Unknown {};
                         },
@@ -848,7 +933,7 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                             }
                             let mut data: [u8; 256] = [0; 256];
                             data[0..8].clone_from_slice(&switch_state);
-                            data[8..10].clone_from_slice(&[0, 256_u16.wrapping_sub((checksum & 0xFF) as u16) as u8]);
+                            data[8..10].clone_from_slice(&[256_u16.wrapping_sub((checksum & 0xFF) as u16) as u8, 0]);
                             match host_tx2.send(Response::Message { data, len: 10 }) {
                                 Ok(_) => {},
                                 Err(err) => {error!("SPI: Error sending to host (2): {}", err); return;}
