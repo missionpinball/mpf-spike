@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::env;
 use std::os::unix::io::FromRawFd;
-use log::{info, trace, error};
+use log::{info, warn, trace, error};
 use std::io::ErrorKind;
 
 extern crate termios;
@@ -33,6 +33,11 @@ enum SpiMessage {
     },
     ReadLocalSwitches,
     Exit
+}
+
+enum SpikeVersion {
+    Spike1,
+    Spike2,
 }
 
 enum PollResult {
@@ -253,11 +258,11 @@ mod tests {
         let spi_fd_in = TestPipeReader{ receiver: spi_in_rx };
 
         let (spi_out_tx, spi_out_rx) = mpsc::channel::<u8>();
-        let spi_fd_out = TestPipeSender{ sender: spi_out_tx };
+        let dmd_fd_out = TestPipeSender{ sender: spi_out_tx };
 
         let backlight_fd = File::open("/dev/null").unwrap();
 
-        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_in_raw, bus_fd_out, spi_fd_in, spi_fd_out, backlight_fd);
+        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_in_raw, bus_fd_out, spi_fd_in, Some(dmd_fd_out), Some(backlight_fd));
 
         // Test init
         write_to_pipe(&host_in_tx, vec![0x80, 0x02, 0xf1, 0x8d, 0x00]);
@@ -420,6 +425,9 @@ fn main() {
 
     // Parse args first
     let args: Vec<String> = env::args().collect();
+
+    let spike_version;
+
     // First arg is serial speed
     let serial_speed;
     if args.len() >= 2 {
@@ -440,6 +448,30 @@ fn main() {
         }
     } else {
         serial_speed = 0 as u32;
+    }
+    if args.len() >= 3 {
+        match args[2].as_ref() {
+            "SPIKE1" => {spike_version = SpikeVersion::Spike1},
+            "SPIKE2" => {spike_version = SpikeVersion::Spike2},
+            _ => {panic!("Invalid spike version! {}", args[2]); }
+        }
+    } else {
+        // Default to Spike 1
+        spike_version = SpikeVersion::Spike1;
+    }
+
+
+    let bus_device;
+    let spi_device;
+    match spike_version {
+        SpikeVersion::Spike1 => {
+            bus_device = "/dev/ttyS4";
+            spi_device = "/dev/spi1";
+        },
+        SpikeVersion::Spike2 => {
+            bus_device = "/dev/ttymxc1";
+            spi_device = "/dev/spidev1.0";
+        },
     }
 
     let std_in;
@@ -463,7 +495,7 @@ fn main() {
     let host_fd_out = std_out;
 
     // Open the bus
-    let bus_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/ttyS4").unwrap();
+    let bus_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open(bus_device).unwrap();
     let mut termios = Termios::from_fd(bus_fd.as_raw_fd()).unwrap();
     cfmakeraw(&mut termios);
     cfsetspeed(&mut termios, B460800).unwrap();
@@ -478,13 +510,21 @@ fn main() {
     let bus_fd = TimeoutReader::new(bus_fd, Duration::from_millis(200));
 
     // Open SPI for local switches
-    let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi1").unwrap();
+    let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open(spi_device).unwrap();
 
-    // Open DMD
-    let dmd_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi0").unwrap();
-
-    // Open magic backlight device
-    let backlight_fd = File::open("/dev/backlight").unwrap();
+    // Open DMD and backlight (Spike 1 only)
+    let dmd_fd;
+    let backlight_fd;
+    match spike_version {
+        SpikeVersion::Spike1 => {
+            dmd_fd = Some(OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi0").unwrap());
+            backlight_fd = Some(File::open("/dev/backlight").unwrap());
+        },
+        SpikeVersion::Spike2 => {
+            dmd_fd = None;
+            backlight_fd = None;
+        },
+    }
 
     // Open magic gpio device
     let gpio_fd = File::open("/dev/gpio").unwrap();
@@ -664,7 +704,8 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
     BOut: std::io::Write + std::marker::Send + std::os::unix::io::AsRawFd + 'static,
     SIn: std::io::Read + std::marker::Send + 'static, SOut: std::io::Write + std::marker::Send + 'static,
     Bl: std::marker::Send + std::os::unix::io::AsRawFd + 'static>
-(host_fd_in: HIn, host_fd_out: HOut, bus_fd_in: BIn,  bus_fd_in_raw: i32, bus_fd_out: BOut, spi_fd_in: SIn, dmd_fd: SOut, backlight_fd: Bl) -> Vec<JoinHandle<()>> {
+(host_fd_in: HIn, host_fd_out: HOut, bus_fd_in: BIn,  bus_fd_in_raw: i32, bus_fd_out: BOut, spi_fd_in: SIn,
+ dmd_fd: Option<SOut>, backlight_fd: Option<Bl>) -> Vec<JoinHandle<()>> {
     // Talk to the spike bus
     let (bus_tx, bus_rx) = mpsc::channel::<NodeBusMessage>();
 
@@ -910,15 +951,29 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                         },
                         SpiMessage::DmdFrame { data } => {
                             // Write to DMD via SPI
-                            trace!("SPI: Writing DMD frame");
-                            fd_out.write(&data).unwrap();
+                            match fd_out.as_mut() {
+                                None => {
+                                    warn!("Got DMD frame without DMD device.")
+                                },
+                                Some(dmd_fd) => {
+                                    trace!("SPI: Writing DMD frame");
+                                    dmd_fd.write(&data).unwrap();
+                                },
+                            }
                         },
                         SpiMessage::BacklightLed { brightness } => {
-                            // Control backlight LED
-                            trace!("SPI: Setting backlight to {}", brightness);
-                            let brightness = brightness as libc::c_int * 256;
-                            unsafe {
-                                ioctl::set_brightness(backlight_fd.as_raw_fd(), &brightness).unwrap();
+                            match backlight_fd.as_ref() {
+                                None => {
+                                    warn!("Tried to set backlight without device.")
+                                },
+                                Some(fd) => {
+                                    // Control backlight LED
+                                    trace!("SPI: Setting backlight to {}", brightness);
+                                    let brightness = brightness as libc::c_int * 256;
+                                    unsafe {
+                                        ioctl::set_brightness(fd.as_raw_fd(), &brightness).unwrap();
+                                    }
+                                },
                             }
                         },
                         SpiMessage::ReadLocalSwitches => {
