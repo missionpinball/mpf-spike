@@ -1,5 +1,7 @@
-[build]
-target = "armv5te-unknown-linux-musleabi"
-
+# for spike 1
 [target.armv5te-unknown-linux-musleabi]
-linker = "arm-unknown-linux-musleabi-gcc"
+linker = "armv5te-unknown-linux-musleabi-gcc"
+
+# for spike 2
+[target.armv7-unknown-linux-musleabihf]
+linker = "armv7-unknown-linux-musleabihf-gcc"
