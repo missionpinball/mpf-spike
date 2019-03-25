@@ -119,7 +119,9 @@ mod ioctl {
     lazy_static! {
         pub static ref BACKLIGHT_BRIGHTNESS: Arc<Mutex<i32>> =
             Arc::new(Mutex::new(0));
-    }
+        pub static ref IOCTL_LOCK: Arc<Mutex<i32>> =
+            Arc::new(Mutex::new(0));
+}
 
     pub unsafe fn set_brightness(_fd: i32, _value: &libc::c_int) -> Result<(), Error> {
         let mut data = BACKLIGHT_BRIGHTNESS.lock().unwrap();
@@ -169,6 +171,7 @@ mod tests {
     use std::sync::mpsc::RecvTimeoutError;
     use std::os::unix::io::AsRawFd;
     use crate::ioctl;
+    use crate::SpikeVersion;
 
     struct TestPipeSender {
         sender: Sender<u8>
@@ -239,8 +242,8 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
-        stderrlog::new().module(module_path!()).init().unwrap();
+    fn integration_test_spike1() {
+        //stderrlog::new().module(module_path!()).init().unwrap();
         let (host_in_tx, host_in_rx) = mpsc::channel::<u8>();
         let host_fd_in = TestPipeReader{ receiver: host_in_rx };
 
@@ -262,7 +265,8 @@ mod tests {
 
         let backlight_fd = File::open("/dev/null").unwrap();
 
-        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_in_raw, bus_fd_out, spi_fd_in, Some(dmd_fd_out), Some(backlight_fd));
+        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_in_raw,
+                                  bus_fd_out, spi_fd_in, Some(dmd_fd_out), Some(backlight_fd), SpikeVersion::Spike1{});
 
         // Test init
         write_to_pipe(&host_in_tx, vec![0x80, 0x02, 0xf1, 0x8d, 0x00]);
@@ -351,20 +355,41 @@ mod tests {
         let data = read_from_pipe(&host_out_rx, 1);
         assert_eq!(data, [0x08]);
 
-        // Set backlight
-        write_to_pipe(&host_in_tx, vec![0x80, 0x04, 0x80, 0x00, 0xff, 0xff, 0x00]);
-        // Send command to node (with response_len 12) to make sure that everything was processed
-        write_to_pipe(&host_in_tx, vec![0x81, 0x02, 0xfe, 0x7f, 0x0c]);
-        // Check that node got message
-        let data = read_from_pipe(&bus_out_rx, 5);
-        assert_eq!(data, [0x81, 0x02, 0xfe, 0x7f, 0x0c]);
-        // Node sends response
-        write_to_pipe(&bus_in_tx, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // Check that host got the response from the node
-        let data = read_from_pipe(&host_out_rx, 12);
-        assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // Assert backlight
-        assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xff * 256);
+        {
+            // Lock IOCTL mock to prevent other tests from breaking stuff
+            let _guard  = ioctl::IOCTL_LOCK.lock().unwrap();
+            *ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap() = 0;
+
+            // Set backlight
+            write_to_pipe(&host_in_tx, vec![0x80, 0x04, 0x80, 0x00, 0xff, 0xff, 0x00]);
+            // Send command to node (with response_len 12) to make sure that everything was processed
+            write_to_pipe(&host_in_tx, vec![0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+            // Check that node got message
+            let data = read_from_pipe(&bus_out_rx, 5);
+            assert_eq!(data, [0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+            // Node sends response
+            write_to_pipe(&bus_in_tx, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            // Check that host got the response from the node
+            let data = read_from_pipe(&host_out_rx, 12);
+            assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            // Assert backlight
+            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xff00);
+
+            // Set backlight via Spike 2 command
+            write_to_pipe(&host_in_tx, vec![0x09, 0x02, 0xcc, 0x11, 0x00]);
+            // Send command to node (with response_len 12) to make sure that everything was processed
+            write_to_pipe(&host_in_tx, vec![0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+            // Check that node got message
+            let data = read_from_pipe(&bus_out_rx, 5);
+            assert_eq!(data, [0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+            // Node sends response
+            write_to_pipe(&bus_in_tx, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            // Check that host got the response from the node
+            let data = read_from_pipe(&host_out_rx, 12);
+            assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            // Assert backlight
+            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xcc00);
+        }
 
         // SetResponseTime
         write_to_pipe(&host_in_tx, vec![0x06, 0x02, 0x45, 0x03, 0x00]);
@@ -404,6 +429,177 @@ mod tests {
         write_to_pipe(&host_in_tx, message);
         let data = read_from_pipe(&spi_out_rx, 2048);
         assert_eq!(data, dmd_frame);
+
+        // Quit
+        write_to_pipe(&host_in_tx, vec![0xF5]);
+
+        for thread in threads {
+           match thread.join() {
+               Ok(_) => {},
+               Err(_) => {panic!("Thread crashed")},
+           }
+        }
+    }
+
+    #[test]
+    fn integration_test_spike2() {
+        //stderrlog::new().module(module_path!()).init().unwrap();
+        let (host_in_tx, host_in_rx) = mpsc::channel::<u8>();
+        let host_fd_in = TestPipeReader{ receiver: host_in_rx };
+
+        let (host_out_tx, host_out_rx) = mpsc::channel::<u8>();
+        let host_fd_out = TestPipeSender{ sender: host_out_tx };
+
+        let (bus_in_tx, bus_in_rx) = mpsc::channel::<u8>();
+        let bus_fd_in = TestPipeReader{ receiver: bus_in_rx };
+        let bus_fd_in_raw = bus_fd_in.as_raw_fd();
+
+        let (bus_out_tx, bus_out_rx) = mpsc::channel::<u8>();
+        let bus_fd_out = TestPipeSender{ sender: bus_out_tx };
+
+        let (spi_in_tx, spi_in_rx) = mpsc::channel::<u8>();
+        let spi_fd_in = TestPipeReader{ receiver: spi_in_rx };
+
+        let threads = run_threads(host_fd_in, host_fd_out, bus_fd_in, bus_fd_in_raw,
+                                  bus_fd_out, spi_fd_in, None::<TestPipeSender>, None::<TestPipeSender>, SpikeVersion::Spike2{});
+
+        // Test init
+        write_to_pipe(&host_in_tx, vec![0x80, 0x02, 0xf1, 0x8d, 0x00]);
+        let data = read_from_pipe(&bus_out_rx, 5);
+        assert_eq!(data, [0x80, 0x02, 0xf1, 0x8d, 0x00]);
+
+        // Send command to node (with response_len 12)
+        write_to_pipe(&host_in_tx, vec![0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 5);
+        assert_eq!(data, [0x81, 0x02, 0xfe, 0x7f, 0x0c]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 12);
+        assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // Sleep
+        write_to_pipe(&host_in_tx, vec![0x01, 0x10]);
+
+        // Poll
+        write_to_pipe(&host_in_tx, vec![0x00]);
+        let data = read_from_pipe(&bus_out_rx, 1);
+        assert_eq!(data, [0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x00]);
+        // SPI sends switches
+        write_to_pipe(&spi_in_tx, vec![0x00; 8]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, [0x00]);
+
+        // Poll (board 8 dirty)
+        write_to_pipe(&host_in_tx, vec![0x00]);
+        let data = read_from_pipe(&bus_out_rx, 1);
+        assert_eq!(data, [0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x08]);
+        // SPI sends switches
+        write_to_pipe(&spi_in_tx, vec![0x00; 8]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, [0x08]);
+
+        // Poll (SPI dirty)
+        write_to_pipe(&host_in_tx, vec![0x00]);
+        let data = read_from_pipe(&bus_out_rx, 1);
+        assert_eq!(data, [0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x00]);
+        // SPI sends switches (one changed)
+        write_to_pipe(&spi_in_tx, vec![0x02, 0, 0, 0, 0, 0, 0, 0]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, [0xF0]);
+
+        // Poll (SPI and node dirty)
+        write_to_pipe(&host_in_tx, vec![0x00]);
+        let data = read_from_pipe(&bus_out_rx, 1);
+        assert_eq!(data, [0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x08]);
+        // SPI sends switches (one changed)
+        write_to_pipe(&spi_in_tx, vec![0x03, 0, 0, 0, 0, 0, 0, 0]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, [0xF0]);
+
+        // Read switches from SPI
+        write_to_pipe(&host_in_tx, vec![0x80, 0x02, 0x11, 0xFF, 0x0B]);
+        // SPI sends switches
+        write_to_pipe(&spi_in_tx, vec![0x03, 0, 0, 0, 0, 0, 0, 0]);
+        // Check that host got the response
+        let data = read_from_pipe(&host_out_rx, 10);
+        assert_eq!(data, [0x03, 0, 0, 0, 0, 0, 0, 0, 253, 0]);
+
+        // Poll (SPI no longer dirty but node dirty)
+        write_to_pipe(&host_in_tx, vec![0x00]);
+        let data = read_from_pipe(&bus_out_rx, 1);
+        assert_eq!(data, [0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x08]);
+        // SPI sends switches (one changed)
+        write_to_pipe(&spi_in_tx, vec![0x03, 0, 0, 0, 0, 0, 0, 0]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, [0x08]);
+
+        {
+            // Lock IOCTL mock to prevent other tests from breaking stuff
+            let _guard = ioctl::IOCTL_LOCK.lock().unwrap();
+            *ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap() = 0x12345678;
+
+            // Set backlight via Spike 1/MPF command
+            write_to_pipe(&host_in_tx, vec![0x80, 0x04, 0x80, 0x00, 0xff, 0xff, 0x00]);
+            // Check that it got translated to spike 2 command
+            let data = read_from_pipe(&bus_out_rx, 4);
+            assert_eq!(data, [0x09, 0x02, 0xff, 0x00]);
+            // Assert backlight has not been touched
+            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0x12345678);
+
+            // Set backlight via Spike 2 command
+            write_to_pipe(&host_in_tx, vec![0x09, 0x02, 0xcc, 0x11, 0x00]);
+            // Check that it got forwarded to the bus
+            let data = read_from_pipe(&bus_out_rx, 4);
+            assert_eq!(data, [0x09, 0x02, 0xcc, 0x11]);
+            // Assert backlight has not been touched
+            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0x12345678);
+        }
+
+        // SetResponseTime
+        write_to_pipe(&host_in_tx, vec![0x06, 0x02, 0x45, 0x03, 0x00]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 4);
+        assert_eq!(data, [0x06, 0x02, 0x45, 0x03]);
+        // No response
+
+        // GetBridgeVersion
+        write_to_pipe(&host_in_tx, vec![0x03, 0x00, 0x03]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 2);
+        assert_eq!(data, [0x03, 0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x01, 0x00, 0x03]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 3);
+        assert_eq!(data, vec![0x01, 0x00, 0x03]);
+
+        // GetBridgeState
+        write_to_pipe(&host_in_tx, vec![0x05, 0x00, 0x01]);
+        // Check that node got message
+        let data = read_from_pipe(&bus_out_rx, 2);
+        assert_eq!(data, [0x05, 0x00]);
+        // Node sends response
+        write_to_pipe(&bus_in_tx, vec![0x18]);
+        // Check that host got the response from the node
+        let data = read_from_pipe(&host_out_rx, 1);
+        assert_eq!(data, vec![0x18]);
 
         // Quit
         write_to_pipe(&host_in_tx, vec![0xF5]);
@@ -545,7 +741,7 @@ fn main() {
     }
 
     trace!("Starting threads!");
-    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd);
+    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd, spike_version);
 
     trace!("Waiting for threads!");
     for thread in threads {
@@ -565,7 +761,7 @@ fn main() {
 }
 
 
-fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus_tx: &Sender<NodeBusMessage>, spi_tx: &Sender<SpiMessage>) -> Result<bool, Error> {
+fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus_tx: &Sender<NodeBusMessage>, spi_tx: &Sender<SpiMessage>, spike_version: &SpikeVersion) -> Result<bool, Error> {
     // First read node byte
     let mut node = [0; 1];
     trace!("Host: Reading Node Info.");
@@ -610,6 +806,23 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
             }
             let mut response_len = [0; 1];
             host_fd_in.read_exact(&mut response_len)?;
+
+            if node[0] == 0x09 {
+                if let SpikeVersion::Spike1{} = spike_version {
+                    // LEDs on local node/Backlight
+                    trace!("Host: Set backlight. Intercepting Spike 2 command for Spike 1.");
+                    let message = SpiMessage::BacklightLed {
+                        brightness: data[0]
+                    };
+                    match spi_tx.send(message) {
+                        Ok(_) => {},
+                        Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted,
+                                                         "Could not send set backlight to spi"));},
+                    }
+                    return Ok(false)
+                }
+            }
+
             let message = NodeBusMessage::BridgeMessage {
                 cmd: node[0],
                 len: len[0],
@@ -667,15 +880,35 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
                     Ok(false)
                 } else if node[0] == 0x80 && len[0] == 4 && cmd[0] == 0x80 {
                     // LEDs on local node/Backlight
-                    trace!("Host: Set backlight");
-                    let message = SpiMessage::BacklightLed {
-                        brightness: data[1]
-                    };
-                    match spi_tx.send(message) {
-                        Ok(_) => {},
-                        Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send set backlight to spi"));},
+                    match spike_version {
+                        SpikeVersion::Spike1{} => {
+                            trace!("Host: Set backlight via LED command.");
+                            let message = SpiMessage::BacklightLed {
+                                brightness: data[1]
+                            };
+                            match spi_tx.send(message) {
+                                Ok(_) => {},
+                                Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send set backlight to spi"));},
+                            }
+                            Ok(false)
+                        },
+                        SpikeVersion::Spike2{} => {
+                            trace!("Host: Set backlight via LED command. Emulate Spike 1 command for Spike 2.");
+                            let mut bridge_message: [u8; 256] = [0; 256];
+                            bridge_message[0] = data[1];
+                            let message = NodeBusMessage::BridgeMessage {
+                                cmd: 0x09,
+                                len: 2,
+                                data: bridge_message,
+                                response_len: 0
+                            };
+                            match bus_tx.send(message) {
+                                Ok(_) => {},
+                                Err(_) => {return Err(Error::new(ErrorKind::ConnectionAborted, "Could not send bridge command to nodebus"));},
+                            }
+                            Ok(false)
+                        }
                     }
-                    Ok(false)
                 } else {
                     // Forward to node bus
                     trace!("Host: Got nodebus message");
@@ -705,7 +938,7 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
     SIn: std::io::Read + std::marker::Send + 'static, SOut: std::io::Write + std::marker::Send + 'static,
     Bl: std::marker::Send + std::os::unix::io::AsRawFd + 'static>
 (host_fd_in: HIn, host_fd_out: HOut, bus_fd_in: BIn,  bus_fd_in_raw: i32, bus_fd_out: BOut, spi_fd_in: SIn,
- dmd_fd: Option<SOut>, backlight_fd: Option<Bl>) -> Vec<JoinHandle<()>> {
+ dmd_fd: Option<SOut>, backlight_fd: Option<Bl>, spike_version: SpikeVersion) -> Vec<JoinHandle<()>> {
     // Talk to the spike bus
     let (bus_tx, bus_rx) = mpsc::channel::<NodeBusMessage>();
 
@@ -845,7 +1078,7 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
     let host_stdin_handler = thread::spawn(move || {
         let mut host_fd_in = host_fd_in;
         loop {
-            match host_thread(&mut host_fd_in, &bus_tx, &spi_tx) {
+            match host_thread(&mut host_fd_in, &bus_tx, &spi_tx, &spike_version) {
                 Ok(done) => {if done {info!("Host: Thread done"); break;}},
                 Err(err) => {error!("Host: Got error {}", err); break;},
             }
