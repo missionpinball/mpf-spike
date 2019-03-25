@@ -14,7 +14,11 @@ http://docs.missionpinball.org/en/latest/hardware/spike
 sudo docker run --rm -it -v "$(pwd)":/home/rust/src messense/rust-musl-cross:armv5te-musleabi
 # compile (inside docker)
 cargo build --release --target=armv5te-unknown-linux-musleabi
+# exit docker (ctrl+d)
+# copy build
+cp target/armv5te-unknown-linux-musleabi/release/mpf-spike bridge-spike1
 ```
+
 
 The finished binary will be in ``target/armv5te-unknown-linux-musleabi/release/mpf-spike``.
 
@@ -25,6 +29,9 @@ The finished binary will be in ``target/armv5te-unknown-linux-musleabi/release/m
 sudo docker run --rm -it -v "$(pwd)":/home/rust/src messense/rust-musl-cross:armv7-musleabihf
 # compile (inside docker)
 cargo build --release --target=armv7-unknown-linux-musleabihf
+# exit docker (ctrl+d)
+# copy build
+cp target/armv7-unknown-linux-musleabihf/release/mpf-spike bridge-spike2
 ```
 
 ## Installing
