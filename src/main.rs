@@ -16,7 +16,9 @@ use std::env;
 use std::os::unix::io::FromRawFd;
 use log::{info, warn, trace, error};
 use std::io::ErrorKind;
+use crate::libc::c_int;
 
+extern crate ioctl_rs as ioctl;
 extern crate termios;
 extern crate nix;
 #[cfg(not(test))]
@@ -85,7 +87,7 @@ enum Response {
 }
 
 #[cfg(not(test))]
-mod ioctl {
+mod ioctl_custom {
     use nix::*;
 
     #[allow(dead_code)]
@@ -110,7 +112,7 @@ mod ioctl {
 extern crate lazy_static;
 
 #[cfg(test)]
-mod ioctl {
+mod ioctl_custom {
     use nix::Error;
 
 
@@ -170,7 +172,7 @@ mod tests {
     use std::os::raw::c_int;
     use std::sync::mpsc::RecvTimeoutError;
     use std::os::unix::io::AsRawFd;
-    use crate::ioctl;
+    use crate::ioctl_custom;
     use crate::SpikeVersion;
 
     struct TestPipeSender {
@@ -357,8 +359,8 @@ mod tests {
 
         {
             // Lock IOCTL mock to prevent other tests from breaking stuff
-            let _guard  = ioctl::IOCTL_LOCK.lock().unwrap();
-            *ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap() = 0;
+            let _guard  = ioctl_custom::IOCTL_LOCK.lock().unwrap();
+            *ioctl_custom::BACKLIGHT_BRIGHTNESS.lock().unwrap() = 0;
 
             // Set backlight
             write_to_pipe(&host_in_tx, vec![0x80, 0x04, 0x80, 0x00, 0xff, 0xff, 0x00]);
@@ -373,7 +375,7 @@ mod tests {
             let data = read_from_pipe(&host_out_rx, 12);
             assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             // Assert backlight
-            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xff00);
+            assert_eq!(*ioctl_custom::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xff00);
 
             // Set backlight via Spike 2 command
             write_to_pipe(&host_in_tx, vec![0x09, 0x02, 0xcc, 0x11, 0x00]);
@@ -388,7 +390,7 @@ mod tests {
             let data = read_from_pipe(&host_out_rx, 12);
             assert_eq!(data, vec![0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             // Assert backlight
-            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xcc00);
+            assert_eq!(*ioctl_custom::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0xcc00);
         }
 
         // SetResponseTime
@@ -552,8 +554,8 @@ mod tests {
 
         {
             // Lock IOCTL mock to prevent other tests from breaking stuff
-            let _guard = ioctl::IOCTL_LOCK.lock().unwrap();
-            *ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap() = 0x12345678;
+            let _guard = ioctl_custom::IOCTL_LOCK.lock().unwrap();
+            *ioctl_custom::BACKLIGHT_BRIGHTNESS.lock().unwrap() = 0x12345678;
 
             // Set backlight via Spike 1/MPF command
             write_to_pipe(&host_in_tx, vec![0x80, 0x04, 0x80, 0x00, 0xff, 0xff, 0x00]);
@@ -561,7 +563,7 @@ mod tests {
             let data = read_from_pipe(&bus_out_rx, 4);
             assert_eq!(data, [0x09, 0x02, 0xff, 0x00]);
             // Assert backlight has not been touched
-            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0x12345678);
+            assert_eq!(*ioctl_custom::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0x12345678);
 
             // Set backlight via Spike 2 command
             write_to_pipe(&host_in_tx, vec![0x09, 0x02, 0xcc, 0x11, 0x00]);
@@ -569,7 +571,7 @@ mod tests {
             let data = read_from_pipe(&bus_out_rx, 4);
             assert_eq!(data, [0x09, 0x02, 0xcc, 0x11]);
             // Assert backlight has not been touched
-            assert_eq!(*ioctl::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0x12345678);
+            assert_eq!(*ioctl_custom::BACKLIGHT_BRIGHTNESS.lock().unwrap(), 0x12345678);
         }
 
         // SetResponseTime
@@ -692,6 +694,11 @@ fn main() {
 
     // Open the bus
     let bus_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open(bus_device).unwrap();
+    ioctl::tiocmbis(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
+    thread::sleep(Duration::from_millis(5 as u64));
+    ioctl::tiocmbic(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
+    thread::sleep(Duration::from_millis(5 as u64));
+
     let mut termios = Termios::from_fd(bus_fd.as_raw_fd()).unwrap();
     cfmakeraw(&mut termios);
     cfsetspeed(&mut termios, B460800).unwrap();
@@ -727,17 +734,19 @@ fn main() {
 
     unsafe {
         // From NODEBUS_Init
-        ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x8C).unwrap();
-        ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x8A).unwrap();
+        ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x8C).unwrap();
+        ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8A).unwrap();
 
         // Enable nodebus power
-        ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x6B).unwrap();
+        ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6B).unwrap();
         // Enable amp (disabled for now because we do not use it anyway)
-        //ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x6A).unwrap();
+        //ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6A).unwrap();
 
         // From NODEBUS_Init (only during open)
-        //ioctl::set_gpio_on(gpio_fd.as_raw_fd(), 0x8E).unwrap();
-        //ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
+        ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x8E).unwrap();
+        thread::sleep(Duration::from_millis(5 as u64));
+        ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
+        thread::sleep(Duration::from_millis(5 as u64));
     }
 
     trace!("Starting threads!");
@@ -751,9 +760,9 @@ fn main() {
 
     unsafe {
         // Disable nodebus power
-        ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x6B).unwrap();
+        ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6B).unwrap();
         // Disable amp (disabled for now because we do not use it anyway)
-        //ioctl::set_gpio_off(gpio_fd.as_raw_fd(), 0x6A).unwrap();
+        //ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6A).unwrap();
     }
     tcsetattr(std_in.as_raw_fd(), TCSAFLUSH, &termios_old).unwrap();
     println!("Resetting terminal mode and quitting.");
@@ -1204,7 +1213,7 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                                     trace!("SPI: Setting backlight to {}", brightness);
                                     let brightness = brightness as libc::c_int * 256;
                                     unsafe {
-                                        ioctl::set_brightness(fd.as_raw_fd(), &brightness).unwrap();
+                                        ioctl_custom::set_brightness(fd.as_raw_fd(), &brightness).unwrap();
                                     }
                                 },
                             }
