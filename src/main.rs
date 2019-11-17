@@ -17,6 +17,7 @@ use std::os::unix::io::FromRawFd;
 use log::{info, warn, trace, error};
 use std::io::ErrorKind;
 use crate::libc::c_int;
+use std::os::unix::io::RawFd;
 
 extern crate ioctl_rs as ioctl;
 extern crate termios;
@@ -105,6 +106,8 @@ mod ioctl_custom {
 
     ioctl_write_int_bad!(set_gpio_on, GPIO_ON);
     ioctl_write_int_bad!(set_gpio_off, GPIO_OFF);
+
+    ioctl_read_bad!(fionread, libc::FIONREAD, libc::c_int);
 }
 
 #[cfg(test)]
@@ -132,9 +135,7 @@ mod ioctl_custom {
     }
 
     #[allow(dead_code)]
-    pub unsafe fn get_gpio_state(_fd: i32, _value: libc::c_int) -> Result<bool, Error> {
-        Ok(false)
-    }
+    pub unsafe fn get_gpio_state(_fd: i32, _value: &mut libc::c_int) -> Result<(), Error> { Ok(()) }
 
     pub unsafe fn set_gpio_on(_fd: i32, _value: libc::c_int) -> Result<(), Error> {
         Ok(())
@@ -143,6 +144,16 @@ mod ioctl_custom {
     pub unsafe fn set_gpio_off(_fd: i32, _value: libc::c_int) -> Result<(), Error> {
         Ok(())
     }
+
+    pub unsafe fn fionread(_fd: i32, _value: &mut libc::c_int) -> Result<(), Error> { Ok(() )
+    }
+}
+
+pub fn fionread(fd: RawFd) -> Result<u32, nix::Error> {
+    let mut retval: libc::c_int = 0;
+    unsafe { ioctl_custom::fionread(fd, &mut retval) }
+        .map(|_| retval as u32)
+        .map_err(|e| e.into())
 }
 
 #[cfg(test)]
@@ -805,7 +816,7 @@ fn host_thread<HIn: std::io::Read + std::marker::Send>(host_fd_in: &mut HIn, bus
             }
             Ok(false)
         },
-        2 ... 10 => {
+        2 ..= 10 => {
             trace!("Host: Got Bridge Command");
             let mut len = [0; 1];
             host_fd_in.read_exact(&mut len)?;
@@ -964,6 +975,17 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
         loop {
             trace!("Bus: Waiting for message");
             let received = bus_rx.recv();
+
+            // Check if we got stray data in between
+            match fionread(bus_fd_in_raw) {
+                Ok(bytes) => {
+                    if bytes > 0 {
+                        warn!("Bus: Got {} unexpected bytes in on bus.", bytes);
+                    }
+                },
+                Err(e) => {warn!("Bus: Failed to get bytes from bus: {}", e);}
+            }
+
             // flush input
             unsafe {
                 libc::tcflush(bus_fd_in_raw, TCIFLUSH);
@@ -1041,6 +1063,20 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                                         }
                                     },
                                 }
+                            }
+
+                            // Check if we got additional data after command (even without any readback)
+                            match fionread(bus_fd_in_raw) {
+                                Ok(bytes) => {
+                                    if bytes > 0 {
+                                        warn!("Bus: Got {} unexpected bytes in on bus after command {}.", bytes, cmd);
+                                        // flush input
+                                        unsafe {
+                                            libc::tcflush(bus_fd_in_raw, TCIFLUSH);
+                                        }
+                                    }
+                                },
+                                Err(e) => {warn!("Bus: Failed to get bytes from bus: {}", e);}
                             }
                         },
                         NodeBusMessage::Poll => {
