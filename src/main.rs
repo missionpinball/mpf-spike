@@ -18,6 +18,9 @@ use log::{info, warn, trace, error};
 use std::io::ErrorKind;
 use crate::libc::c_int;
 use std::os::unix::io::RawFd;
+use gpio::GpioOut;
+use std::io::Write;
+use std::clone::Clone;
 
 extern crate ioctl_rs as ioctl;
 extern crate termios;
@@ -38,6 +41,7 @@ enum SpiMessage {
     Exit
 }
 
+#[derive(Clone)]
 enum SpikeVersion {
     Spike1,
     Spike2,
@@ -720,6 +724,7 @@ fn main() {
     tcsetattr(bus_fd.as_raw_fd(), TCSANOW, &termios).unwrap();
 
     let bus_fd2 = bus_fd.try_clone().unwrap();
+    let mut bus_init = bus_fd.try_clone().unwrap();
     let bus_fd_raw = bus_fd.as_raw_fd();
     let bus_fd = TimeoutReader::new(bus_fd, Duration::from_millis(200));
 
@@ -729,39 +734,51 @@ fn main() {
     // Open DMD and backlight (Spike 1 only)
     let dmd_fd;
     let backlight_fd;
-    match spike_version {
+    match &spike_version {
         SpikeVersion::Spike1 => {
             dmd_fd = Some(OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi0").unwrap());
             backlight_fd = Some(File::open("/dev/backlight").unwrap());
+
+            // Open magic gpio device
+            let gpio_fd = File::open("/dev/gpio").unwrap();
+
+            unsafe {
+                // From NODEBUS_Init
+                ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x8C).unwrap();
+                ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8A).unwrap();
+
+                // Enable nodebus power
+                ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6B).unwrap();
+                // Enable amp (disabled for now because we do not use it anyway)
+                //ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6A).unwrap();
+
+                // From NODEBUS_Init (only during open)
+                ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x8E).unwrap();
+                thread::sleep(Duration::from_millis(5 as u64));
+                ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
+                thread::sleep(Duration::from_millis(5 as u64));
+            }
         },
         SpikeVersion::Spike2 => {
             dmd_fd = None;
             backlight_fd = None;
+
+            // SetIspPin to true
+            let mut isp_pin = gpio::sysfs::SysFsGpioOutput::open(75).unwrap();
+            isp_pin.set_high().unwrap();
+
+            // /sys/class/gpio/export -> write "75"
+            // /sys/class/gpio/gpio75 -> write "out"
+            // /sys/class/gpio/gpio75 -> write "1"
+
+            // SetPower on
+            bus_init.write(vec![0x07, 0x01, 0x01, 0x00].as_slice()).unwrap();
+            bus_init.flush().unwrap();
         },
     }
 
-    // Open magic gpio device
-    let gpio_fd = File::open("/dev/gpio").unwrap();
-
-    unsafe {
-        // From NODEBUS_Init
-        ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x8C).unwrap();
-        ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8A).unwrap();
-
-        // Enable nodebus power
-        ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6B).unwrap();
-        // Enable amp (disabled for now because we do not use it anyway)
-        //ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6A).unwrap();
-
-        // From NODEBUS_Init (only during open)
-        ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x8E).unwrap();
-        thread::sleep(Duration::from_millis(5 as u64));
-        ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
-        thread::sleep(Duration::from_millis(5 as u64));
-    }
-
     trace!("Starting threads!");
-    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd, spike_version);
+    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd, spike_version.clone());
 
     trace!("Waiting for threads!");
     for thread in threads {
@@ -769,11 +786,22 @@ fn main() {
     }
     trace!("All threads stopped.");
 
-    unsafe {
-        // Disable nodebus power
-        ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6B).unwrap();
-        // Disable amp (disabled for now because we do not use it anyway)
-        //ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6A).unwrap();
+    match &spike_version {
+        SpikeVersion::Spike1 => {
+            // Open magic gpio device
+            let gpio_fd = File::open("/dev/gpio").unwrap();
+            unsafe {
+                // Disable nodebus power
+                ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6B).unwrap();
+                // Disable amp
+                ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6A).unwrap();
+            }
+        },
+        SpikeVersion::Spike2 => {
+            // SetPower off - this is safe because all threads stopped
+            bus_init.write(vec![0x07, 0x01, 0x00, 0x00].as_slice()).unwrap();
+            bus_init.flush().unwrap();
+        },
     }
     tcsetattr(std_in.as_raw_fd(), TCSAFLUSH, &termios_old).unwrap();
     println!("Resetting terminal mode and quitting.");

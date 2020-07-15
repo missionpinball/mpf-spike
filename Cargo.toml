@@ -12,6 +12,7 @@ libc = "0.2.49"
 log = "0.4"
 stderrlog = "0.4"
 ioctl-rs = "0.2"
+gpio = "0.4.1"
 
 [dev-dependencies]
 lazy_static = "1.3.0"
