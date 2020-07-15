@@ -10,27 +10,16 @@ http://docs.missionpinball.org/en/latest/hardware/spike
 ## Cross Compiling for Spike 1 (if you made changes)
 
 ```
-# change into image
-sudo docker run --rm -it -v "$(pwd)":/home/rust/src messense/rust-musl-cross:armv5te-musleabi
-# compile (inside docker)
-cargo build --release --target=armv5te-unknown-linux-musleabi
-# exit docker (ctrl+d)
-# copy build
+cargo install cross
+cross build --target armv5te-unknown-linux-musleabi --release
 cp target/armv5te-unknown-linux-musleabi/release/mpf-spike bridge-spike1
 ```
-
-
-The finished binary will be in ``target/armv5te-unknown-linux-musleabi/release/mpf-spike``.
 
 ## Cross Compiling for Spike 2 (if you made changes)
 
 ```
-# change into image
-sudo docker run --rm -it -v "$(pwd)":/home/rust/src messense/rust-musl-cross:armv7-musleabihf
-# compile (inside docker)
-cargo build --release --target=armv7-unknown-linux-musleabihf
-# exit docker (ctrl+d)
-# copy build
+cargo install cross
+cross build --target armv7-unknown-linux-musleabihf --release
 cp target/armv7-unknown-linux-musleabihf/release/mpf-spike bridge-spike2
 ```
 
