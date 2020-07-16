@@ -757,6 +757,14 @@ fn main() {
                 thread::sleep(Duration::from_millis(5 as u64));
                 ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x8E).unwrap();
                 thread::sleep(Duration::from_millis(5 as u64));
+
+                // Disable nodebus power
+                ioctl_custom::set_gpio_off(gpio_fd.as_raw_fd(), 0x6B).unwrap();
+                thread::sleep(Duration::from_millis(1000 as u64));
+
+                // Enable nodebus power again
+                ioctl_custom::set_gpio_on(gpio_fd.as_raw_fd(), 0x6B).unwrap();
+                thread::sleep(Duration::from_millis(500 as u64));
             }
         },
         SpikeVersion::Spike2 => {
@@ -774,6 +782,18 @@ fn main() {
             // SetPower on
             bus_init.write(vec![0x07, 0x01, 0x01].as_slice()).unwrap();
             bus_init.flush().unwrap();
+
+            // SetPower off
+            bus_init.write(vec![0x07, 0x01, 0x00].as_slice()).unwrap();
+            bus_init.flush().unwrap();
+
+            thread::sleep(Duration::from_millis(1000 as u64));
+
+            // SetPower on again
+            bus_init.write(vec![0x07, 0x01, 0x00].as_slice()).unwrap();
+            bus_init.flush().unwrap();
+
+            thread::sleep(Duration::from_millis(500 as u64));
         },
     }
 
@@ -799,7 +819,7 @@ fn main() {
         },
         SpikeVersion::Spike2 => {
             // SetPower off - this is safe because all threads stopped
-            bus_init.write(vec![0x07, 0x01, 0x00, 0x00].as_slice()).unwrap();
+            bus_init.write(vec![0x07, 0x01, 0x00].as_slice()).unwrap();
             bus_init.flush().unwrap();
         },
     }
