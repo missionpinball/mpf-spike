@@ -772,7 +772,7 @@ fn main() {
             // /sys/class/gpio/gpio75 -> write "1"
 
             // SetPower on
-            bus_init.write(vec![0x07, 0x01, 0x01, 0x00].as_slice()).unwrap();
+            bus_init.write(vec![0x07, 0x01, 0x01].as_slice()).unwrap();
             bus_init.flush().unwrap();
         },
     }
@@ -1008,7 +1008,16 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
             match fionread(bus_fd_in_raw) {
                 Ok(bytes) => {
                     if bytes > 0 {
+                        let mut unexpected_data = [0; 256];
                         warn!("Bus: Got {} unexpected bytes in on bus.", bytes);
+                        match fd_in.read_exact(&mut unexpected_data[0..(bytes as usize)]) {
+                            Ok(_) => {
+                                trace!("Bus: Got unexpected data: {:x?}", &unexpected_data[0..(bytes as usize)]);
+                            },
+                            Err(err) => {
+                                error!("Bus: Got error during read of unexpected bytes: {}", err);
+                            },
+                        }
                     }
                 },
                 Err(e) => {warn!("Bus: Failed to get bytes from bus: {}", e);}
@@ -1023,19 +1032,19 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                 Ok(message) => {
                     match message {
                         NodeBusMessage::BusMessage { node, cmd, len, data, checksum, response_len } => {
-                            trace!("Bus: Sending message. node: {} cmd: {} len: {} response_len: {}", node, cmd, len, response_len);
                             let mut message = vec!();
                             message.extend(&[node, len, cmd]);
                             message.extend(&data[0..((len - 2) as usize)]);
                             message.extend(&[checksum, response_len]);
                             fd_out.write(message.as_slice()).unwrap();
                             fd_out.flush().unwrap();
+                            trace!("Bus: Sending message. node: {} cmd: {} len: {} response_len: {} msg: {:x?}", node & 0x3f, cmd, len, response_len, &message);
                             if response_len > 0 {
                                 trace!("Bus: Reading input");
                                 let mut response = [0; 256];
                                 match fd_in.read_exact(&mut response[0..(response_len as usize)]) {
                                     Ok(_) => {
-                                        trace!("Bus: Got response");
+                                        trace!("Bus: Got response: {:x?}", &response[0..(response_len as usize)]);
                                         // Forward response to host
                                         match host_tx.send(Response::Message { data: response, len: response_len }) {
                                             Ok(_) => {},
@@ -1058,7 +1067,6 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                             }
                         },
                         NodeBusMessage::BridgeMessage { cmd, len, data, response_len } => {
-                            trace!("Bus: Sending message to bridge. cmd: {} len: {} response_len: {}", cmd, len, response_len);
                             let mut message = vec!();
                             message.extend(&[cmd, len]);
                             if len > 0 {
@@ -1066,6 +1074,7 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                             }
                             fd_out.write(message.as_slice()).unwrap();
                             fd_out.flush().unwrap();
+                            trace!("Bus: Sending message to bridge. cmd: {} len: {} response_len: {} msg: {:x?}", cmd, len, response_len, &message);
                             if response_len > 0 {
                                 trace!("Bus: Reading input");
                                 let mut response = [0; 256];
@@ -1098,6 +1107,16 @@ fn run_threads<HIn: std::io::Read + std::marker::Send + 'static, HOut: std::io::
                                 Ok(bytes) => {
                                     if bytes > 0 {
                                         warn!("Bus: Got {} unexpected bytes in on bus after command {}.", bytes, cmd);
+                                        let mut unexpected_data = [0; 256];
+                                        match fd_in.read_exact(&mut unexpected_data[0..(bytes as usize)]) {
+                                            Ok(_) => {
+                                                trace!("Bus: Got unexpected data: {:x?}", &unexpected_data[0..(bytes as usize)]);
+                                            },
+                                            Err(err) => {
+                                                error!("Bus: Got error during read of unexpected bytes: {}", err);
+                                            },
+                                        }
+
                                         // flush input
                                         unsafe {
                                             libc::tcflush(bus_fd_in_raw, TCIFLUSH);
