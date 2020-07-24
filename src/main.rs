@@ -790,7 +790,7 @@ fn main() {
             thread::sleep(Duration::from_millis(1000 as u64));
 
             // SetPower on again
-            bus_init.write(vec![0x07, 0x01, 0x00].as_slice()).unwrap();
+            bus_init.write(vec![0x07, 0x01, 0x01].as_slice()).unwrap();
             bus_init.flush().unwrap();
 
             thread::sleep(Duration::from_millis(500 as u64));
