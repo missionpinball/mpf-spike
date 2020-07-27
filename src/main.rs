@@ -709,10 +709,6 @@ fn main() {
 
     // Open the bus
     let bus_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open(bus_device).unwrap();
-    ioctl::tiocmbis(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
-    thread::sleep(Duration::from_millis(5 as u64));
-    ioctl::tiocmbic(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
-    thread::sleep(Duration::from_millis(5 as u64));
 
     let mut termios = Termios::from_fd(bus_fd.as_raw_fd()).unwrap();
     cfmakeraw(&mut termios);
@@ -726,7 +722,7 @@ fn main() {
     let bus_fd2 = bus_fd.try_clone().unwrap();
     let mut bus_init = bus_fd.try_clone().unwrap();
     let bus_fd_raw = bus_fd.as_raw_fd();
-    let bus_fd = TimeoutReader::new(bus_fd, Duration::from_millis(200));
+    let bus_fd_reader = TimeoutReader::new(bus_fd.try_clone().unwrap(), Duration::from_millis(200));
 
     // Open SPI for local switches
     let spi_fd = OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open(spi_device).unwrap();
@@ -779,6 +775,12 @@ fn main() {
             // /sys/class/gpio/gpio75 -> write "out"
             // /sys/class/gpio/gpio75 -> write "1"
 
+            // This might reset the netbridge CPU
+            ioctl::tiocmbis(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
+            thread::sleep(Duration::from_millis(5 as u64));
+            ioctl::tiocmbic(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
+            thread::sleep(Duration::from_millis(5 as u64));
+
             // SetPower on
             bus_init.write(vec![0x07, 0x01, 0x01].as_slice()).unwrap();
             bus_init.flush().unwrap();
@@ -798,7 +800,7 @@ fn main() {
     }
 
     trace!("Starting threads!");
-    let threads = run_threads(host_fd_in, host_fd_out, bus_fd, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd, spike_version.clone());
+    let threads = run_threads(host_fd_in, host_fd_out, bus_fd_reader, bus_fd_raw, bus_fd2, spi_fd, dmd_fd, backlight_fd, spike_version.clone());
 
     trace!("Waiting for threads!");
     for thread in threads {
@@ -818,6 +820,8 @@ fn main() {
             }
         },
         SpikeVersion::Spike2 => {
+            // Reset Bus
+            bus_init.write(vec![0x80, 0x01, 0xF1].as_slice()).unwrap();
             // SetPower off - this is safe because all threads stopped
             bus_init.write(vec![0x07, 0x01, 0x00].as_slice()).unwrap();
             bus_init.flush().unwrap();
