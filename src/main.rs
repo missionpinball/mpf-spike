@@ -632,10 +632,10 @@ mod tests {
 
 
 fn main() {
-    trace!("MPF Spike Bridge! Git Hash: {}", env!("GIT_HASH"));
     println!("MPF Spike Bridge!");
     stderrlog::new().module(module_path!()).verbosity(10).init().unwrap();
     trace!("MPF Spike Bridge Started!");
+    trace!("Git Hash: {}", env!("GIT_HASH"));
 
     // Parse args first
     let args: Vec<String> = env::args().collect();
@@ -679,10 +679,16 @@ fn main() {
     let spi_device;
     match spike_version {
         SpikeVersion::Spike1 => {
+            trace!("Spike 1 early init");
             bus_device = "/dev/ttyS4";
             spi_device = "/dev/spi1";
         },
         SpikeVersion::Spike2 => {
+            trace!("Spike 2 early init");
+            // SetIspPin to true
+            let mut isp_pin = gpio::sysfs::SysFsGpioOutput::open(75).unwrap();
+            isp_pin.set_high().expect("Setting ISP failed.");
+
             bus_device = "/dev/ttymxc1";
             spi_device = "/dev/spidev1.0";
         },
@@ -733,6 +739,7 @@ fn main() {
     let backlight_fd;
     match &spike_version {
         SpikeVersion::Spike1 => {
+            trace!("Spike 1 late init");
             dmd_fd = Some(OpenOptions::new().write(true).read(true).custom_flags(libc::O_SYNC | libc::O_NOCTTY).open("/dev/spi0").unwrap());
             backlight_fd = Some(File::open("/dev/backlight").unwrap());
 
@@ -765,12 +772,9 @@ fn main() {
             }
         },
         SpikeVersion::Spike2 => {
+            trace!("Spike 2 late init");
             dmd_fd = None;
             backlight_fd = None;
-
-            // SetIspPin to true
-            let mut isp_pin = gpio::sysfs::SysFsGpioOutput::open(75).unwrap();
-            isp_pin.set_high().expect("Setting ISP failed.");
 
             // This might reset the netbridge CPU
             ioctl::tiocmbis(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed.");
