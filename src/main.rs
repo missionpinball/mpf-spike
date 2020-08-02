@@ -632,6 +632,7 @@ mod tests {
 
 
 fn main() {
+    trace!("MPF Spike Bridge! Git Hash: {}", env!("GIT_HASH"));
     println!("MPF Spike Bridge!");
     stderrlog::new().module(module_path!()).verbosity(10).init().unwrap();
     trace!("MPF Spike Bridge Started!");
@@ -769,16 +770,12 @@ fn main() {
 
             // SetIspPin to true
             let mut isp_pin = gpio::sysfs::SysFsGpioOutput::open(75).unwrap();
-            isp_pin.set_high().unwrap();
-
-            // /sys/class/gpio/export -> write "75"
-            // /sys/class/gpio/gpio75 -> write "out"
-            // /sys/class/gpio/gpio75 -> write "1"
+            isp_pin.set_high().expect("Setting ISP failed.");
 
             // This might reset the netbridge CPU
-            ioctl::tiocmbis(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
+            ioctl::tiocmbis(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed.");
             thread::sleep(Duration::from_millis(5 as u64));
-            ioctl::tiocmbic(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Setting RTS failed");
+            ioctl::tiocmbic(bus_fd.as_raw_fd(), ioctl::TIOCM_RTS as c_int).expect("Clearing RTS failed.");
             thread::sleep(Duration::from_millis(5 as u64));
 
             // SetPower on
